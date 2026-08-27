@@ -380,6 +380,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
+    src/lib/ps2_disc_fs.cpp
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
@@ -439,6 +440,11 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
 )
 
+file(GLOB RUNNER_GENERATED_SRC_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/generated/*.cpp"
+)
+list(APPEND RUNNER_SRC_FILES ${RUNNER_GENERATED_SRC_FILES})
+
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 
@@ -466,6 +472,13 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
         UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
     )
 endif()
+
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp"
+    PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION ON
+        COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:MSVC>:/bigobj>"
+)
 
 if(PS2X_ENABLE_RUNNER_PCH)
     set(PS2X_RUNNER_PCH_HEADERS
@@ -497,6 +510,11 @@ endif()
 
 if(MSVC)
     target_compile_options(ps2EntryRunner PRIVATE /FS)
+endif()
+
+if(MSVC)
+    target_compile_options(ps2_runtime PRIVATE /MP /FS)
+    target_compile_options(ps2EntryRunner PRIVATE /MP)
 endif()
 
 target_include_directories(ps2_runtime PUBLIC

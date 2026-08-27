@@ -27,6 +27,10 @@
 #include <unordered_map>
 #include <sstream>
 
+// Force-links per-game override translation units that would otherwise be
+// dropped by the linker from this static library (see DQ8.cpp for why).
+extern "C" void ps2x_force_link_dq8_overrides();
+
 namespace ps2_stubs
 {
     void resetSifState();
@@ -964,11 +968,18 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         return false;
     }
 
+    ps2x_force_link_dq8_overrides();
+
     ps2_game_overrides::applyMatching(*this,
                                       elfPath,
                                       m_cpuContext.pc,
                                       elfCrc32,
                                       elfCrc32Valid);
+
+    // One-time proof that the real disc filesystem reader (see project
+    // memory 2026-08-27) integrates and opens correctly inside the actual
+    // runtime process, not just the standalone test it was validated with.
+    (void)discFs();
 
     RUNTIME_LOG("ELF file loaded successfully. Entry point: 0x" << std::hex << m_cpuContext.pc << std::dec);
     return true;
@@ -1313,6 +1324,1204 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    uint32_t sif12bcd4ClientPtr = 0u;
+
+    // DIAGNOSTIC (see project memory, 2026-08-26): find the actual
+    // indirect-jump/call instruction responsible for thread 1's crash into
+    // 0x250ca4 (a mid-function label inside the heap allocator FUN_00250b80,
+    // not a valid call/jump target) -- dump sourcePc/kind and the full
+    // register file at the exact moment this target is dispatched, so the
+    // offending instruction and the register that carried the bad value can
+    // be identified by reading the generated code at sourcePc.
+    if (targetPc == 0x250ca4u)
+    {
+        static std::atomic<uint32_t> s_loggedBadJumpTo250ca4{0u};
+        if (s_loggedBadJumpTo250ca4.fetch_add(1u, std::memory_order_relaxed) < 10u)
+        {
+            std::cerr << "[bad-jump-250ca4] source=0x" << std::hex << sourcePc
+                      << " kind=" << describeGuestBranchKind(kind)
+                      << " name=" << (debugName ? debugName : "?")
+                      << " nestedCallDepth=" << std::dec << m_nestedCallDepth << std::hex
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << " sp=0x" << getRegU32(ctx, 29)
+                      << " gp=0x" << getRegU32(ctx, 28)
+                      << " v0=0x" << getRegU32(ctx, 2)
+                      << " v1=0x" << getRegU32(ctx, 3)
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << " a3=0x" << getRegU32(ctx, 7)
+                      << " t0=0x" << getRegU32(ctx, 8)
+                      << " t1=0x" << getRegU32(ctx, 9)
+                      << " s0=0x" << getRegU32(ctx, 16)
+                      << " s1=0x" << getRegU32(ctx, 17)
+                      << " s2=0x" << getRegU32(ctx, 18)
+                      << " t9=0x" << getRegU32(ctx, 25)
+                      << std::dec << std::endl;
+        }
+    }
+
+    {
+        static std::atomic<int64_t> s_lastHeartbeatMs{0};
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+        int64_t last = s_lastHeartbeatMs.load(std::memory_order_relaxed);
+        if (nowMs - last >= 1000 &&
+            s_lastHeartbeatMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed))
+        {
+            std::cerr << "[pc-heartbeat] t=" << nowMs << " pc=0x" << std::hex << targetPc
+                       << " source=0x" << sourcePc << std::dec << std::endl;
+        }
+    }
+
+    // EXPERIMENTAL FIX: func_11A588 (see project memory, 2026-08-25) is DQ8's
+    // own inlined SIF RPC bind implementation -- it creates a fresh semaphore,
+    // sends a SIF_CMD_RPC_BIND packet via func_119A30/func_119D30 (DQ8's own
+    // low-level SIF send routines, not our syscall layer, so our runtime
+    // never gets a chance to signal completion), then WaitSema()s on that
+    // semaphore forever waiting for an IOP response that never arrives.
+    // Rather than replicate DQ8's own low-level SIF packet-send protocol,
+    // pre-signal the exact semaphore it's about to wait on -- the semaphore
+    // id is already in a0 at this call site (confirmed empirically) -- so
+    // its own WaitSema call succeeds immediately, exactly as if the IOP had
+    // just responded. This runs every time this call site is hit (not just
+    // once), since a fresh semaphore is created per bind attempt.
+    // DIAGNOSTIC (see project memory, 2026-08-25): FUN_001641C0 (called
+    // from FUN_00160b00 at 0x160d44, well after thread 3 is created) is a
+    // sync/teardown routine for thread 3's semaphore pair, gated by a guard
+    // read from [gp-0x7088] at its very top -- if that guard is false, the
+    // whole thread-3 signal-and-wait sequence is skipped silently. Checking
+    // its actual value at the call site to confirm this is why semaphore
+    // 37 is never signaled.
+    if (sourcePc >= 0x1693b0u && sourcePc < 0x169744u)
+    {
+        static std::atomic<uint32_t> s_loggedInner{0u};
+        if (s_loggedInner.fetch_add(1u, std::memory_order_relaxed) < 40u)
+        {
+            std::cerr << "[fun1693b0-inner] source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc << std::dec << std::endl;
+        }
+    }
+    if (sourcePc >= 0x1690e0u && sourcePc < 0x1693b0u)
+    {
+        static std::atomic<uint32_t> s_loggedInner2{0u};
+        if (s_loggedInner2.fetch_add(1u, std::memory_order_relaxed) < 40u)
+        {
+            std::cerr << "[fun1690e0-inner] source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc << std::dec << std::endl;
+        }
+    }
+    if (sourcePc >= 0x177310u && sourcePc < 0x1777d4u)
+    {
+        static std::atomic<uint32_t> s_loggedInner3{0u};
+        if (s_loggedInner3.fetch_add(1u, std::memory_order_relaxed) < 60u)
+        {
+            int curPrio = -1, curId = -999;
+            if (m_eeScheduler)
+            {
+                curId = m_eeScheduler->currentThreadId();
+                const EeKernelSnapshot snap = m_eeScheduler->snapshot();
+                for (const EeThreadSnapshot &t : snap.threads)
+                {
+                    if (t.id == curId) { curPrio = t.currentPriority; break; }
+                }
+            }
+            std::cerr << "[fun177310-inner] source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc << std::dec
+                      << " threadId=" << curId << " priority=" << curPrio
+                      << std::endl;
+        }
+    }
+
+    if (sourcePc == 0x160ce4u || sourcePc == 0x160d04u || sourcePc == 0x160d0cu ||
+        sourcePc == 0x160d14u || sourcePc == 0x160d1cu || sourcePc == 0x160d28u ||
+        sourcePc == 0x160d3cu)
+    {
+        static std::atomic<uint32_t> s_loggedCheckpoint{0u};
+        if (s_loggedCheckpoint.fetch_add(1u, std::memory_order_relaxed) < 20u)
+        {
+            std::cerr << "[fun160b00-checkpoint] source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc << std::dec << std::endl;
+        }
+    }
+
+    // FIX (see project memory, 2026-08-26): DQ8 calls its own inlined SIF
+    // RPC bind routine (func_11A588) from MANY distinct external call sites
+    // to bind different IOP modules in sequence (confirmed: 0x12bcd4 with
+    // a1=0x80000100, 0x12bd28 with a1=0x80000101, likely more elsewhere).
+    // Each caller independently re-checks its OWN client struct's
+    // SifRpcClientData_t::server field (offset 0x24) after the call and
+    // retries its whole delay+bind sequence forever if it's still NULL. The
+    // existing 2026-08-25 fix (gated on func_11A588's own internal WaitSema
+    // call site, sourcePc==0x11a664, using register $17 as the client
+    // pointer) does not reliably resolve to the SAME client struct the
+    // external caller re-checks (confirmed empirically for the 0x12bcd4
+    // site: infinite retry until fixed here instead). Rather than add a new
+    // per-call-site gate for every module DQ8 binds, generalize: capture
+    // a0 (the client struct pointer) on ANY call into func_11A588 and patch
+    // its server field after the call returns, regardless of caller.
+    //
+    // DIAGNOSTIC (see project memory, 2026-08-26): DQ8's own inlined SIF
+    // bind (func_11A588) allocates a generic 64-byte pool slot (func_119FA8)
+    // and sends its ENTIRE contents as the bind request payload via
+    // func_119B68(a0=0x80000009 [SIF_CMD_RPC_BIND], a1=bufferPtr, a2=0x40).
+    // Our runtime's IOP subsystem has real (if stubbed) service handlers
+    // (dbcman, mcserv, libsd, etc, each with a known SID like dbcman's
+    // 0x80001300) but NOTHING today ever routes DQ8's own raw SIF sends to
+    // them (confirmed: zero "[ps2xIOP]"/"[DBCMAN:stub]" log lines across the
+    // ENTIRE day's testing) -- the existing presignal fixes only fake the
+    // completion semaphore, never the real service dispatch, so every bind
+    // and call "succeeds" but carries no real (even stubbed) response data.
+    // Dump the full 64-byte buffer for every observed bind send to find
+    // exactly where the target SID lives in DQ8's own packet layout, as a
+    // prerequisite for properly wiring this to the real IopSubsystem.
+    if (targetPc == 0x119b68u && getRegU32(ctx, 4) == 0x80000009u && rdram)
+    {
+        const uint32_t bufPtr = getRegU32(ctx, 5) & 0x1FFFFFFFu;
+        static std::atomic<uint32_t> s_loggedBindPacket{0u};
+        if (s_loggedBindPacket.fetch_add(1u, std::memory_order_relaxed) < 30u)
+        {
+            std::ostringstream oss;
+            oss << "[bind-packet-dump] source=0x" << std::hex << sourcePc
+                << " bufPtr=0x" << bufPtr << " words=";
+            if (bufPtr <= PS2_RAM_SIZE - 64u)
+            {
+                for (uint32_t i = 0; i < 16u; ++i)
+                {
+                    uint32_t word = 0u;
+                    std::memcpy(&word, rdram + bufPtr + i * 4u, sizeof(word));
+                    oss << "0x" << word << " ";
+                }
+            }
+            else
+            {
+                oss << "(out of range)";
+            }
+            std::cerr << oss.str() << std::dec << std::endl;
+        }
+
+        // FIX (see project memory, 2026-08-27): func_119FA8 (the 64-byte SIF
+        // packet pool DQ8's own bind/call implementations allocate from,
+        // confirmed via full read of its scan-for-free-slot logic) never has
+        // its slots freed anywhere in DQ8's own code -- real hardware would
+        // free a slot once the IOP signals completion, which we never
+        // simulate. Every bind (and every call, see the matching fix below)
+        // permanently consumes one slot, so the fixed-capacity pool
+        // eventually exhausts, after which func_119FA8 returns NULL and
+        // func_11A588/func_11A768 fail immediately at the allocation step --
+        // this was empirically proven to be the direct cause of a late-boot
+        // infinite bind-retry loop (FUN_0012a990, SID 0x80000595). Clear bit
+        // 0 of the slot's header (slot+0x10) -- confirmed via direct read of
+        // func_119FA8 to be exactly the "in use" flag the scanner checks --
+        // to free it back to the pool right after its one-and-only send.
+        if (bufPtr <= PS2_RAM_SIZE - 0x14u)
+        {
+            uint32_t flags = 0u;
+            std::memcpy(&flags, rdram + bufPtr + 0x10u, sizeof(flags));
+            flags &= ~1u;
+            std::memcpy(rdram + bufPtr + 0x10u, &flags, sizeof(flags));
+        }
+    }
+
+    // DIAGNOSTIC (see project memory, 2026-08-26): the matching CALL-side
+    // dump. DQ8's inlined SIF call (func_11A768) sends via the same
+    // func_119B68(a0=0x8000000A [SIF_CMD_RPC_CALL], a1=bufferPtr, a2=0x40)
+    // primitive. Packet layout matches the real SifCallRpc(client,
+    // rpc_number, mode, send_buf, send_size, recv_buf, recv_size, ...)
+    // parameter order: word[7] (+0x1c) = the caller's client struct pointer
+    // (the SAME object address passed to func_11A588 at bind time -- usable
+    // to manually correlate a call back to whichever bind established it),
+    // word[8] (+0x20) = rpc_number (the actual function being requested on
+    // the target service), word[9] (+0x24) = send_size, word[10] (+0x28) =
+    // recv_buf, word[11] (+0x2c) = recv_size.
+    if (targetPc == 0x119b68u && getRegU32(ctx, 4) == 0x8000000au && rdram)
+    {
+        const uint32_t bufPtr = getRegU32(ctx, 5) & 0x1FFFFFFFu;
+        static std::atomic<uint32_t> s_loggedCallPacket{0u};
+        if (s_loggedCallPacket.fetch_add(1u, std::memory_order_relaxed) < 2000u)
+        {
+            std::ostringstream oss;
+            oss << "[call-packet-dump] source=0x" << std::hex << sourcePc
+                << " bufPtr=0x" << bufPtr << " words=";
+            if (bufPtr <= PS2_RAM_SIZE - 64u)
+            {
+                for (uint32_t i = 0; i < 16u; ++i)
+                {
+                    uint32_t word = 0u;
+                    std::memcpy(&word, rdram + bufPtr + i * 4u, sizeof(word));
+                    oss << "0x" << word << " ";
+                }
+            }
+            else
+            {
+                oss << "(out of range)";
+            }
+            std::cerr << oss.str() << std::dec << std::endl;
+        }
+
+        // FIX (see project memory, 2026-08-27): same pool-exhaustion fix as
+        // the bind side above -- func_11A768 sends the SAME pool slot twice
+        // (a queue-reserve probe then the real dispatch), so this fires at
+        // both send sites; clearing an already-cleared bit is a harmless
+        // no-op, so freeing at both is safe.
+        if (bufPtr <= PS2_RAM_SIZE - 0x14u)
+        {
+            uint32_t flags = 0u;
+            std::memcpy(&flags, rdram + bufPtr + 0x10u, sizeof(flags));
+            flags &= ~1u;
+            std::memcpy(rdram + bufPtr + 0x10u, &flags, sizeof(flags));
+        }
+    }
+
+    if (targetPc == 0x11a588u)
+    {
+        static std::atomic<uint32_t> s_loggedSifBindGeneric{0u};
+        const uint32_t nSifBindGeneric = s_loggedSifBindGeneric.fetch_add(1u, std::memory_order_relaxed);
+        if (nSifBindGeneric < 100u)
+        {
+            std::cerr << "[sifbind-generic] source=0x" << std::hex << sourcePc
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5) << std::dec << std::endl;
+        }
+
+        // NOTE (see project memory, 2026-08-26): the actual server-field fix
+        // for this call site is applied AFTER the nested call returns (see
+        // near targetFn(rdram, ctx, this) below) -- func_11A588 evidently
+        // reinitializes/zeroes its client struct as part of its own setup,
+        // so writing here (before the call) gets silently overwritten.
+        sif12bcd4ClientPtr = getRegU32(ctx, 4) & 0x1FFFFFFFu;
+    }
+
+    if (targetPc == 0x1641c0u)
+    {
+        static std::atomic<uint32_t> s_loggedGuard{0u};
+        if (s_loggedGuard.fetch_add(1u, std::memory_order_relaxed) < 10u && rdram)
+        {
+            uint32_t guardVal = 0xdeadbeefu;
+            std::memcpy(&guardVal, rdram + 0x3d26e8u, sizeof(guardVal));
+            std::cerr << "[thread3-sync-guard] source=0x" << std::hex << sourcePc
+                      << " guardValAt0x3d26e8=0x" << guardVal << std::dec << std::endl;
+        }
+    }
+
+    // DIAGNOSTIC (see project memory, 2026-08-25): does FUN_00160b00 (the
+    // same orchestrator that creates worker threads 3/5/7) ever reach its
+    // own later call to FUN_00108398 (video-mode setup, guaranteed to call
+    // SetGsCrt)? If it's blocked between creating those threads and this
+    // call, that would mean the stuck semaphores are a genuine deadlock,
+    // not benign idling.
+    if (targetPc == 0x108398u)
+    {
+        static std::atomic<uint32_t> s_loggedVideoModeSetup{0u};
+        if (s_loggedVideoModeSetup.fetch_add(1u, std::memory_order_relaxed) < 10u)
+        {
+            std::cerr << "[video-mode-setup-call] source=0x" << std::hex << sourcePc
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << " a3=0x" << getRegU32(ctx, 7)
+                      << std::dec << std::endl;
+        }
+    }
+    if (targetPc == 0x160b00u && m_eeScheduler)
+    {
+        static std::atomic<uint32_t> s_loggedOrchestratorEntry{0u};
+        if (s_loggedOrchestratorEntry.fetch_add(1u, std::memory_order_relaxed) < 10u)
+        {
+            std::cerr << "[orchestrator-160b00-entry] source=0x" << std::hex << sourcePc << std::dec
+                      << " threadId=" << m_eeScheduler->currentThreadId() << std::endl;
+        }
+    }
+
+    // DIAGNOSTIC (see project memory, 2026-08-25): has DQ8 ever called
+    // SetGsCrt (display mode setup, a hard prerequisite for any visible
+    // output) or GsPutIMR by this point? A clean screenshot with the debug
+    // panel hidden showed a fully black framebuffer after 45s+ -- checking
+    // whether DQ8 has even reached GS/display setup yet.
+    if (targetPc == 0x116420u)
+    {
+        static std::atomic<uint32_t> s_loggedSetGsCrt{0u};
+        if (s_loggedSetGsCrt.fetch_add(1u, std::memory_order_relaxed) < 10u)
+        {
+            std::cerr << "[SetGsCrt-call] source=0x" << std::hex << sourcePc
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << std::dec << std::endl;
+        }
+    }
+    if (targetPc == 0x116b60u)
+    {
+        static std::atomic<uint32_t> s_loggedGsPutIMR{0u};
+        if (s_loggedGsPutIMR.fetch_add(1u, std::memory_order_relaxed) < 10u)
+        {
+            std::cerr << "[GsPutIMR-call] source=0x" << std::hex << sourcePc
+                      << " a0=0x" << getRegU32(ctx, 4) << std::dec << std::endl;
+        }
+    }
+
+    // DIAGNOSTIC (see project memory, 2026-08-25): identify the creator of
+    // each worker thread (entry, sourcePc of the CreateThread call) so the
+    // caller's own code can be inspected for context/subsystem identity --
+    // this is how the id=3/37/67 "who signals this" search continues.
+    if (targetPc == 0x116620u && rdram)
+    {
+        static std::atomic<uint32_t> s_loggedCreateThreadGeneric{0u};
+        if (s_loggedCreateThreadGeneric.fetch_add(1u, std::memory_order_relaxed) < 40u)
+        {
+            const uint32_t paramPtr = getRegU32(ctx, 4) & 0x1FFFFFFFu;
+            uint32_t entry = 0xdeadbeefu;
+            if (paramPtr <= PS2_RAM_SIZE - 8u)
+            {
+                std::memcpy(&entry, rdram + paramPtr + 4u, sizeof(entry));
+            }
+            std::cerr << "[createthread-generic] source=0x" << std::hex << sourcePc
+                      << " entry=0x" << entry << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x116860u && sourcePc == 0x11a664u)
+    {
+        static std::atomic<uint32_t> s_loggedWaitAt11a664{0u};
+        const uint32_t n = s_loggedWaitAt11a664.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 10u)
+        {
+            std::cerr << "[wait-11a664] #" << std::dec << n
+                      << " semId=0x" << std::hex << getRegU32(ctx, 4)
+                      << " s1(reg17)=0x" << getRegU32(ctx, 17)
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << std::dec << std::endl;
+        }
+        if (m_eeScheduler)
+        {
+            const int semId = static_cast<int>(getRegU32(ctx, 4));
+            const int result = m_eeScheduler->signalSemaphore(semId, false);
+            if (n < 10u)
+            {
+                std::cerr << "[sifbind-presignal] semId=" << semId
+                          << " signalResult=" << result << std::endl;
+            }
+        }
+
+        // EXTENDED FIX (see project memory, 2026-08-25): pre-signaling the
+        // semaphore above is only half the picture. func_11A588's own
+        // post-wait check (0x12afbc: `beqz v0, ...` after `v0 = [s1+0x24]`)
+        // tests SifRpcClientData_t::server -- confirmed via real ps2sdk
+        // source (common/include/sifrpc-common.h): the struct is a 16-byte
+        // t_SifRpcHeader (pkt_addr/rpc_id/sema_id/mode) followed by
+        // command/buf/cbuf/end_function/end_param/server, putting `server`
+        // at exactly offset 0x24 -- an exact match for the empirically
+        // observed check, giving high confidence in this read. `server` is
+        // NULL until the IOP's bind-complete response populates it; since
+        // this runtime never delivers that response, it stays NULL forever,
+        // so DQ8 spins in a ~1M-cycle delay loop and retries the whole bind
+        // indefinitely. Write a placeholder non-NULL pointer here (a small
+        // zeroed scratch buffer in the same confirmed-empty region as the
+        // pool-init-fix's slot buffer, but not overlapping it) so DQ8 treats
+        // the bind as complete and proceeds past this check. `s1` (reg17,
+        // the client data pointer) is confirmed available here from the
+        // existing [wait-11a664] log above.
+        if (rdram)
+        {
+            constexpr uint32_t kFakeSifServerData = 0x3d4d00u;
+            constexpr uint32_t kFakeSifServerDataSize = 128u;
+            static std::atomic<bool> s_fakeServerZeroed{false};
+            bool expectedZeroed = false;
+            if (s_fakeServerZeroed.compare_exchange_strong(expectedZeroed, true))
+            {
+                std::memset(rdram + kFakeSifServerData, 0, kFakeSifServerDataSize);
+            }
+            const uint32_t clientPtr = getRegU32(ctx, 17) & 0x1FFFFFFFu;
+            if (clientPtr != 0u && clientPtr <= PS2_RAM_SIZE - 0x28u)
+            {
+                constexpr uint32_t serverFieldOffset = 0x24u;
+                uint32_t serverPtr = kFakeSifServerData;
+                std::memcpy(rdram + clientPtr + serverFieldOffset, &serverPtr, sizeof(serverPtr));
+                if (n < 10u)
+                {
+                    std::cerr << "[sifbind-server-fix] wrote server=0x" << std::hex << serverPtr
+                              << " at client+0x24=0x" << (clientPtr + serverFieldOffset)
+                              << std::dec << std::endl;
+                }
+            }
+        }
+    }
+
+    // EXPERIMENTAL FIX: FUN_0011a768 (0x11a768-0x11a968, see project memory,
+    // 2026-08-25) is DQ8's own inlined SIF RPC *call* implementation (as
+    // opposed to func_11A588's *bind*) -- same shape: func_119FA8 (pool
+    // alloc) -> func_116820 (CreateSema) -> func_119B68 with a0=0x8000000A
+    // (SIF_CMD_RPC_CALL, confirmed against the same constants used for
+    // SIF_CMD_RPC_BIND earlier this session) -> WaitSema([s1+8]) here at
+    // 0x11a924 -> DeleteSema -> unconditional `v0=0` return. Unlike the bind
+    // case, there is no secondary "response ready" struct-field check after
+    // the wait (read the full function body -- it falls straight through to
+    // the epilogue), so only the semaphore pre-signal should be needed here.
+    // DIAGNOSTIC (see project memory, 2026-08-25): confirm whether
+    // FUN_0025a9b0 (VBlank-End handler)'s iPollSema/SignalSema pair at
+    // 0x25a9e4/0x25a9fc actually targets and reaches the same semaphore id
+    // FUN_002592c0 is blocked in WaitSema on -- both read a0 from the same
+    // [gp-0x7464] global, so in principle they must match, but this
+    // confirms it empirically with the actual runtime semaphore id.
+    if (targetPc == 0x116860u && sourcePc == 0x2592d0u)
+    {
+        static std::atomic<uint32_t> s_loggedWaitSemId{0u};
+        if (s_loggedWaitSemId.fetch_add(1u, std::memory_order_relaxed) < 5u)
+        {
+            std::cerr << "[worker-wait-semid] FUN_002592c0 about to WaitSema semId=0x"
+                      << std::hex << getRegU32(ctx, 4) << std::dec << std::endl;
+        }
+    }
+    if (targetPc == 0x116860u && (sourcePc == 0x117560u || sourcePc == 0x1643b4u || sourcePc == 0x16979cu))
+    {
+        static std::atomic<uint32_t> s_loggedOtherWaitSemId{0u};
+        if (s_loggedOtherWaitSemId.fetch_add(1u, std::memory_order_relaxed) < 15u)
+        {
+            std::cerr << "[other-worker-wait-semid] source=0x" << std::hex << sourcePc
+                      << " semId=0x" << getRegU32(ctx, 4) << std::dec << std::endl;
+        }
+    }
+    if (targetPc == 0x116880u && sourcePc == 0x25a9e4u)
+    {
+        static std::atomic<uint32_t> s_loggedPollSemId{0u};
+        if (s_loggedPollSemId.fetch_add(1u, std::memory_order_relaxed) < 10u)
+        {
+            std::cerr << "[vblank-poll-semid] iPollSema semId=0x"
+                      << std::hex << getRegU32(ctx, 4) << std::dec << std::endl;
+        }
+    }
+    if (targetPc == 0x116850u && sourcePc == 0x25a9fcu)
+    {
+        static std::atomic<uint32_t> s_loggedVblankSignal{0u};
+        if (s_loggedVblankSignal.fetch_add(1u, std::memory_order_relaxed) < 10u)
+        {
+            std::cerr << "[vblank-signal-semid] iSignalSema semId=0x"
+                      << std::hex << getRegU32(ctx, 4) << std::dec << std::endl;
+        }
+    }
+
+    // TEMPORARY DIAGNOSTIC (2026-08-27): does 0x3D8768 (the seed target for
+    // func_11B8B0's first comparison) actually still hold "3000" at the
+    // moment of the check? Verifying directly since the seed fix didn't
+    // clear the 0x11bc2c failure path as expected.
+    if (targetPc == 0x11b8b0u && rdram)
+    {
+        uint32_t val3d8768 = 0u, val390f6c = 0u, ptr391030 = 0u, val391030Deref = 0u;
+        std::memcpy(&val3d8768, rdram + 0x3d8768u, sizeof(val3d8768));
+        std::memcpy(&val390f6c, rdram + 0x390f6cu, sizeof(val390f6c));
+        std::memcpy(&ptr391030, rdram + 0x391030u, sizeof(ptr391030));
+        const uint32_t ptr391030Phys = ptr391030 & 0x1FFFFFFFu;
+        if (ptr391030Phys <= PS2_RAM_SIZE - 4u)
+        {
+            std::memcpy(&val391030Deref, rdram + ptr391030Phys, sizeof(val391030Deref));
+        }
+        static std::atomic<uint32_t> s_loggedGateVals{0u};
+        if (s_loggedGateVals.fetch_add(1u, std::memory_order_relaxed) < 30u)
+        {
+            std::cerr << "[fopen-11b8b0-entry] val3d8768=0x" << std::hex << val3d8768
+                      << " val390f6c=0x" << val390f6c
+                      << " ptr391030=0x" << ptr391030
+                      << " val391030Deref=0x" << val391030Deref << std::dec << std::endl;
+        }
+    }
+
+    // TEMPORARY DIAGNOSTIC (2026-08-27): FUN_0011bba8 (the file-open
+    // function) checks a fixed global flag right after its own call to
+    // func_11B010 returns -- both func_11A768 and func_11B010 have been
+    // confirmed (by full read) to unconditionally return 0 on success, so
+    // the address dereferenced here is always exactly `s4` (0x3D0000 +
+    // 0x7C80 = 0x3D7C80), a SINGLE fixed global, not a per-open index.
+    // Logging its value to determine whether this flag is what actually
+    // gates success (and whether/when it's ever nonzero), since a zero-fill
+    // reply fix worked once but not reliably in a longer run.
+    // TEMPORARY DIAGNOSTIC (2026-08-27): func_11B6A8's own s0 (reg16) at the
+    // point it calls func_11AE98 -- right after the SID 0x80000001 bind's
+    // server field became nonzero -- should be the SIF client struct itself.
+    // Confirmed func_11AE98 is unrelated (it only lazily creates two local
+    // semaphores, doesn't touch the client) and the memory mask correctly
+    // discards the uncached-alias bit, so client+0/client+4 read here should
+    // match what the LATER unaligned copy (0x11b854/58) sees at client+0.
+    // Reading both explicitly to pin down exactly which field becomes the
+    // observed value 0x8, since the earlier watchpoint only saw the
+    // DESTINATION (0x3D8768), not the SOURCE client address itself.
+    if (targetPc == 0x11ae98u && sourcePc == 0x11b780u && rdram)
+    {
+        const uint32_t client = getRegU32(ctx, 16) & 0x1FFFFFFFu;
+        uint32_t clientPlus0 = 0u, clientPlus4 = 0u, clientPlus0x24 = 0u;
+        if (client <= PS2_RAM_SIZE - 0x28u)
+        {
+            std::memcpy(&clientPlus0, rdram + client, sizeof(clientPlus0));
+            std::memcpy(&clientPlus4, rdram + client + 4u, sizeof(clientPlus4));
+            std::memcpy(&clientPlus0x24, rdram + client + 0x24u, sizeof(clientPlus0x24));
+        }
+        static std::atomic<uint32_t> s_loggedSid1Client{0u};
+        if (s_loggedSid1Client.fetch_add(1u, std::memory_order_relaxed) < 50u)
+        {
+            std::cerr << "[sid1-client] client=0x" << std::hex << client
+                      << " +0=0x" << clientPlus0 << " +4=0x" << clientPlus4
+                      << " +0x24(server)=0x" << clientPlus0x24 << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x11b5b0u && rdram)
+    {
+        static std::atomic<uint32_t> s_loggedFopenCallSite{0u};
+        if (s_loggedFopenCallSite.fetch_add(1u, std::memory_order_relaxed) < 200u)
+        {
+            std::cerr << "[fopen-callsite] source=0x" << std::hex << sourcePc << std::dec << std::endl;
+        }
+        if (sourcePc == 0x11bd84u)
+        {
+            const uint32_t addr = getRegU32(ctx, 2) & 0x1FFFFFFFu;
+            uint32_t flagVal = 0xdeadbeefu;
+            if (addr <= PS2_RAM_SIZE - 4u)
+            {
+                std::memcpy(&flagVal, rdram + addr, sizeof(flagVal));
+            }
+            static std::atomic<uint32_t> s_loggedOpenGateCheck{0u};
+            if (s_loggedOpenGateCheck.fetch_add(1u, std::memory_order_relaxed) < 200u)
+            {
+                std::cerr << "[fopen-gate-check] addr=0x" << std::hex << addr
+                          << " value=0x" << flagVal << std::dec << std::endl;
+            }
+        }
+    }
+
+    if (targetPc == 0x116860u && sourcePc == 0x11a924u)
+    {
+        static std::atomic<uint32_t> s_loggedWaitAt11a924{0u};
+        const uint32_t n = s_loggedWaitAt11a924.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 2000u)
+        {
+            // DIAGNOSTIC (2026-08-27): checking whether s2/s3/s4 (send_size/
+            // recv_size/recv_buf) still hold the values they had when the
+            // call packet was written (see [call-packet-dump]), or whether
+            // one of the intervening nested calls (func_119D30/func_119B68/
+            // func_116820/func_11A050) clobbers these supposedly callee-saved
+            // registers by the time WaitSema is reached. s0 (reg16, the
+            // packet's own self-pointer/bufPtr) is the correlator against
+            // [call-packet-dump]'s bufPtr= field for the SAME call instance.
+            std::cerr << "[wait-11a924] #" << std::dec << n
+                      << " semId=0x" << std::hex << getRegU32(ctx, 4)
+                      << " s0(reg16,bufPtr)=0x" << getRegU32(ctx, 16)
+                      << " s1(reg17)=0x" << getRegU32(ctx, 17)
+                      << " s2(reg18,sendSize)=0x" << getRegU32(ctx, 18)
+                      << " s3(reg19,recvSize)=0x" << getRegU32(ctx, 19)
+                      << " s4(reg20,recvBuf)=0x" << getRegU32(ctx, 20)
+                      << std::dec << std::endl;
+        }
+
+        // EXPERIMENTAL FIX (see project memory, 2026-08-27): FUN_0011a768's
+        // own body never reads recv_buf itself -- it just WaitSema/DeleteSema
+        // and returns 0 -- so the existing presignal-only fix leaves recv_buf
+        // as stale/zeroed garbage that DQ8's OWN caller (one frame up) then
+        // reads as if it were a real IOP reply.
+        //
+        // CORRECTED (2026-08-27, was reading s2/s3/s4 registers directly --
+        // WRONG): s3 (recv_size at packet-write time) gets legitimately
+        // REPURPOSED by the compiled code itself at 0x11a8ac ("addiu $s3,
+        // $zero, 0x1", the CreateSema initial-count argument) before we ever
+        // reach WaitSema -- proven via a live register dump correlated
+        // against [call-packet-dump] by bufPtr (s0/reg16, confirmed NOT
+        // clobbered): s2/s4 still matched the packet's send_size/recv_buf,
+        // but s3 read back as 0x1 instead of the real recv_size (0x8). The
+        // packet buffer itself (pointed to by s0, still live) is the correct,
+        // robust source: send_size/recv_buf/recv_size live at fixed offsets
+        // +0x24/+0x28/+0x2c within it (confirmed against the packet-dump
+        // hook's own field mapping).
+        // Narrowly scoped to recv_size==8 (the only shape decoded so far, via
+        // CDVDSTM.IRX's sub_1B8) to avoid guessing at the other, still-
+        // uncharacterized call shapes. Fabricates a plausible success reply
+        // (bytesTransferred=send_size, errorCode=0) purely to test whether
+        // this -- not just the semaphore -- is what the 0x3F17B0 entity wait
+        // (2026-08-26) is actually blocked on.
+        if (rdram)
+        {
+            const uint32_t bufPtr = getRegU32(ctx, 16) & 0x1FFFFFFFu;
+            uint32_t rpcNumber = 0u, sendSize = 0u, recvBuf = 0u, recvSize = 0u;
+            if (bufPtr <= PS2_RAM_SIZE - 0x30u)
+            {
+                std::memcpy(&rpcNumber, rdram + bufPtr + 0x20u, sizeof(rpcNumber));
+                std::memcpy(&sendSize, rdram + bufPtr + 0x24u, sizeof(sendSize));
+                std::memcpy(&recvBuf, rdram + bufPtr + 0x28u, sizeof(recvBuf));
+                std::memcpy(&recvSize, rdram + bufPtr + 0x2cu, sizeof(recvSize));
+                recvBuf &= 0x1FFFFFFFu;
+            }
+            // TEMPORARY DIAGNOSTIC (2026-08-27): unconditional, uncapped
+            // check specifically for the client 0x3dd980 / SID 0x80000100
+            // call (recv_buf=0x3ddbc0, recv_size=0x80) to prove definitively
+            // whether WaitSema is even reached for it, independent of the
+            // other capped diagnostics above possibly being exhausted first.
+            if (recvBuf == 0x3ddbc0u)
+            {
+                std::cerr << "[wait-11a924-3dd980] bufPtr=0x" << std::hex << bufPtr
+                          << " sendSize=0x" << sendSize << " recvSize=0x" << recvSize
+                          << std::dec << std::endl;
+            }
+            // FIX (see project memory, 2026-08-27): rpc_number==0xff is a
+            // DIFFERENT call shape from the rpc_number==0 streaming-read
+            // pattern this fix was originally written for, even though both
+            // happen to use recv_size==8. Proven via a live register dump at
+            // the exact write site (func_11B6A8's unaligned copy, s0=reg16)
+            // correlated against this exact client's own captured call
+            // packet: our OWN "bytesTransferred=send_size" reply for THIS
+            // rpc_number was being copied verbatim into 0x3D8768 (a module-
+            // version status field checked by func_11B8B0 against the real
+            // ELF-constant string "3000" at 0x390F6C) -- i.e. we were
+            // supplying a byte count where the game expects a version
+            // string. rpc_number==0xff's reply is that version string.
+            if (recvSize == 8u && rpcNumber == 0xffu && recvBuf <= PS2_RAM_SIZE - 8u)
+            {
+                uint32_t versionString = 0u;
+                uint32_t errorCode = 0u;
+                std::memcpy(&versionString, rdram + 0x390f6cu, sizeof(versionString));
+                std::memcpy(rdram + recvBuf, &versionString, sizeof(versionString));
+                std::memcpy(rdram + recvBuf + 4u, &errorCode, sizeof(errorCode));
+                static std::atomic<uint32_t> s_loggedVersionReply{0u};
+                if (s_loggedVersionReply.fetch_add(1u, std::memory_order_relaxed) < 40u)
+                {
+                    std::cerr << "[sifcall-version-reply] recvBuf=0x" << std::hex << recvBuf
+                              << " versionString=0x" << versionString << std::dec << std::endl;
+                }
+            }
+            else if (recvSize == 8u && recvBuf <= PS2_RAM_SIZE - 8u)
+            {
+                uint32_t bytesTransferred = sendSize;
+                uint32_t errorCode = 0u;
+                std::memcpy(rdram + recvBuf, &bytesTransferred, sizeof(bytesTransferred));
+                std::memcpy(rdram + recvBuf + 4u, &errorCode, sizeof(errorCode));
+                static std::atomic<uint32_t> s_loggedFakeReply{0u};
+                if (s_loggedFakeReply.fetch_add(1u, std::memory_order_relaxed) < 2000u)
+                {
+                    std::cerr << "[sifcall-fake-reply] recvBuf=0x" << std::hex << recvBuf
+                              << " bytesTransferred=0x" << bytesTransferred
+                              << " errorCode=0x" << errorCode << std::dec << std::endl;
+                }
+            }
+            // FIX (see project memory, 2026-08-27): this is DQ8's actual
+            // file-open RPC (FUN_0011bba8 -> func_11B010 -> func_11A768),
+            // captured live via [call-packet-dump] (client=0x3d8740,
+            // rpc_number=0, send_size=0x418, recv_size=4, recv_buf=
+            // 0x3d7c80). No prior branch ever handled recv_size==4, so
+            // recv_buf was left holding stale "3000" from the earlier
+            // version-check reply -- func_11B010's retry loop only checks
+            // the reply's sign bit, so the open "succeeded" purely by
+            // coincidence of that stale value's top bit being clear, not
+            // because we ever actually answered the call.
+            //
+            // Read func_11A768 in full to find the real protocol:
+            // FUN_0011bba8's fixed send buffer at 0x3D7040 (passed as
+            // func_11A768's a3, flushed for DMA via func_119D30, then
+            // forwarded to func_119B68) embeds the semaphore id to signal
+            // at +0x00 -- the real IOP driver would signal it
+            // asynchronously once the actual read completes; this is
+            // FUN_0011bba8's *own* completion semaphore (created via
+            // CreateSema right before this call), separate from
+            // func_11A768's internal call-reply semaphore already
+            // presignaled below -- and the null-terminated file path at
+            // +0x14 (matching the 0x400-byte path-truncation loop read
+            // earlier in FUN_0011bba8). Narrowly gated on rpc_number==0 and
+            // this exact recv_buf to avoid misfiring on other, uncharacted
+            // recv_size==4 call shapes that might exist elsewhere.
+            else if (recvSize == 4u && rpcNumber == 0u && recvBuf == 0x3d7c80u)
+            {
+                constexpr uint32_t kOpenSendBuf = 0x3D7040u;
+                uint32_t semToSignal = 0u;
+                std::memcpy(&semToSignal, rdram + kOpenSendBuf, sizeof(semToSignal));
+                std::string path;
+                for (uint32_t i = 0; i < 0x400u; ++i)
+                {
+                    const char c = static_cast<char>(rdram[kOpenSendBuf + 0x14u + i]);
+                    if (c == '\0')
+                    {
+                        break;
+                    }
+                    path.push_back(c);
+                }
+                std::string lookupPath = path;
+                for (const char *prefix : {"cdrom0:", "cdrom1:", "cdrom:"})
+                {
+                    const size_t prefixLen = std::strlen(prefix);
+                    if (lookupPath.size() >= prefixLen &&
+                        _strnicmp(lookupPath.c_str(), prefix, prefixLen) == 0)
+                    {
+                        lookupPath.erase(0, prefixLen);
+                        break;
+                    }
+                }
+                while (!lookupPath.empty() && (lookupPath.front() == '\\' || lookupPath.front() == '/'))
+                {
+                    lookupPath.erase(0, 1);
+                }
+                uint32_t lba = 0u, size = 0u;
+                bool found = false;
+                if (Ps2DiscFs *fs = discFs())
+                {
+                    found = fs->Locate(lookupPath, lba, size);
+                }
+                const int32_t reply = found ? static_cast<int32_t>(size) : -1;
+                std::memcpy(rdram + recvBuf, &reply, sizeof(reply));
+                static std::atomic<uint32_t> s_loggedOpenReply{0u};
+                if (s_loggedOpenReply.fetch_add(1u, std::memory_order_relaxed) < 100u)
+                {
+                    std::cerr << "[sifcall-open-reply] path=\"" << path
+                              << "\" lookupPath=\"" << lookupPath << "\" found=" << found
+                              << " lba=" << lba << " size=" << size
+                              << " semToSignal=" << semToSignal << std::endl;
+                }
+                if (found && semToSignal != 0u && m_eeScheduler)
+                {
+                    const int signalResult =
+                        m_eeScheduler->signalSemaphore(static_cast<int>(semToSignal), false);
+                    std::cerr << "[sifcall-open-signal] semId=" << semToSignal
+                              << " signalResult=" << signalResult << std::endl;
+                }
+            }
+            // EXPERIMENTAL GENERALIZATION (2026-08-27): other call shapes
+            // exist beyond the recv_size==8 streaming-read pattern (e.g. a
+            // client seen with send_size=recv_size=0x80, and others with
+            // recv_size=0) -- their real reply semantics are NOT understood,
+            // so guessing at specific field values would risk silently
+            // corrupting whatever structure they represent (see project
+            // memory's standing caution on this). Zero-filling is the
+            // deliberately minimal, most conservative fallback: it is
+            // strictly better than the stale garbage a reused, non-zeroed
+            // pool slot would otherwise leave behind (our own pool-slot-
+            // freeing fix only clears the "in use" bit, not the slot's old
+            // contents), and a zeroed reply is a common "no error, no data"
+            // convention -- but it is NOT known to be semantically correct
+            // for any of these other shapes. Purely to test whether DQ8's
+            // own retry logic (e.g. FUN_0011b010's up-to-100-attempt loop)
+            // can make forward progress with a deterministic-but-plausibly-
+            // wrong reply rather than real garbage.
+            else if (recvSize > 8u && recvSize <= 4096u && recvBuf <= PS2_RAM_SIZE - recvSize)
+            {
+                std::memset(rdram + recvBuf, 0, recvSize);
+                static std::atomic<uint32_t> s_loggedGenericFakeReply{0u};
+                if (s_loggedGenericFakeReply.fetch_add(1u, std::memory_order_relaxed) < 2000u)
+                {
+                    std::cerr << "[sifcall-fake-reply-generic] recvBuf=0x" << std::hex << recvBuf
+                              << " recvSize=0x" << recvSize << std::dec << std::endl;
+                }
+            }
+        }
+
+        if (m_eeScheduler)
+        {
+            const int semId = static_cast<int>(getRegU32(ctx, 4));
+            const int result = m_eeScheduler->signalSemaphore(semId, false);
+            if (n < 10u)
+            {
+                std::cerr << "[sifcall-presignal] semId=" << semId
+                          << " signalResult=" << result << std::endl;
+            }
+        }
+    }
+
+    // REVERTED EXPERIMENT (see project memory, 2026-08-25): tried
+    // presignaling three more WaitSema call sites on persistent,
+    // $gp-relative global semaphore ids -- FUN_001643a0 (0x1643b4),
+    // FUN_002592c0 (0x2592d0), FUN_00169790 (0x16979c) -- each gating a
+    // per-iteration worker loop. Unlike the SIF-bind/SIF-call cases (which
+    // wait once per invocation and then move on), these are loops that
+    // WaitSema on every iteration; presignaling every hit let one of them
+    // (0x1643b4) spin as fast as possible forever, starving the scheduler
+    // and causing a measured REGRESSION (only 3 threads / ~1.5B eeCycle
+    // reached in 60s, versus 7 threads / ~17.5B without this fix). Reverted.
+    // These threads are legitimately meant to be woken at a real, bounded
+    // rate (likely VSync-adjacent) -- fixing them needs rate-limited
+    // signaling (e.g. tied to the existing VSync/timer IRQ delivery, not an
+    // unconditional per-hit presignal), not attempted yet.
+
+    if (sourcePc >= 0x12ae98u && sourcePc < 0x12b180u)
+    {
+        static std::atomic<uint32_t> s_traceFun12ae98{0u};
+        const uint32_t n = s_traceFun12ae98.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 60u)
+        {
+            std::cerr << "[trace-12ae98] #" << std::dec << n
+                      << " source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " v0=0x" << getRegU32(ctx, 2)
+                      << std::dec << std::endl;
+        }
+    }
+
+    {
+        static std::atomic<bool> s_awaitingReturnFrom11a588{false};
+        // Only counts as "returned" once sourcePc is outside func_11A588's
+        // own body (0x11a588-0x11a6d4) -- calls made *from within* it (the
+        // pool allocator, CreateSema, the SIF-bind send, WaitSema, etc.)
+        // must not be mistaken for the caller resuming.
+        if (s_awaitingReturnFrom11a588.load(std::memory_order_relaxed) &&
+            (sourcePc < 0x11a588u || sourcePc >= 0x11a6d4u))
+        {
+            s_awaitingReturnFrom11a588.store(false, std::memory_order_relaxed);
+            static std::atomic<uint32_t> s_returnLogCount{0u};
+            const uint32_t n = s_returnLogCount.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 15u)
+            {
+                std::cerr << "[after-11a588-return] #" << std::dec << n
+                          << " nextTarget=0x" << std::hex << targetPc
+                          << " nextSource=0x" << sourcePc
+                          << " v0=0x" << getRegU32(ctx, 2)
+                          << std::dec << std::endl;
+            }
+        }
+        if (targetPc == 0x11a588u)
+        {
+            s_awaitingReturnFrom11a588.store(true, std::memory_order_relaxed);
+        }
+    }
+
+    if (targetPc == 0x119d30u && sourcePc == 0x12afccu)
+    {
+        static std::atomic<uint32_t> s_loggedSuccessPath{0u};
+        const uint32_t n = s_loggedSuccessPath.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 10u)
+        {
+            std::cerr << "[func11a588-success-path-reached] #" << std::dec << n << std::endl;
+        }
+    }
+
+    if (targetPc == 0x11a588u)
+    {
+        static std::atomic<uint32_t> s_loggedCall11a588{0u};
+        const uint32_t n = s_loggedCall11a588.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 15u)
+        {
+            std::cerr << "[call-0x11a588] #" << std::dec << n
+                      << " source=0x" << std::hex << sourcePc
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x116460u)
+    {
+        static std::atomic<uint32_t> s_loggedLoadExec{0u};
+        const uint32_t n = s_loggedLoadExec.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 5u)
+        {
+            std::cerr << "[call-LoadExecPS2] #" << std::dec << n
+                      << " source=0x" << std::hex << sourcePc
+                      << std::dec << std::endl;
+        }
+    }
+
+    if ((targetPc == 0x116840u || targetPc == 0x116850u) && getRegU32(ctx, 4) == 3u)
+    {
+        static std::atomic<uint32_t> s_loggedSignalSema3{0u};
+        const uint32_t n = s_loggedSignalSema3.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 20u)
+        {
+            std::cerr << "[call-signalsema3] #" << std::dec << n
+                      << " target=0x" << std::hex << targetPc
+                      << " source=0x" << sourcePc
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x116620u && sourcePc == 0x117678u)
+    {
+        static std::atomic<bool> s_loggedCreateThread{false};
+        bool expected = false;
+        if (s_loggedCreateThread.compare_exchange_strong(expected, true))
+        {
+            std::cerr << "[createthread-1175f8] a0(prio)=0x" << std::hex << getRegU32(ctx, 4)
+                      << " a1(entry)=0x" << getRegU32(ctx, 5)
+                      << " a2(stack)=0x" << getRegU32(ctx, 6)
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x116830u && sourcePc == 0x11768cu)
+    {
+        static std::atomic<bool> s_loggedCreateThreadFailed{false};
+        bool expected = false;
+        if (s_loggedCreateThreadFailed.compare_exchange_strong(expected, true))
+        {
+            std::cerr << "[createthread-1175f8] FAILED, createThreadRetval(a0 here)=0x"
+                       << std::hex << getRegU32(ctx, 4) << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x117960u && sourcePc == 0x1176acu)
+    {
+        static std::atomic<bool> s_loggedCreateThreadSucceeded{false};
+        bool expected = false;
+        if (s_loggedCreateThreadSucceeded.compare_exchange_strong(expected, true))
+        {
+            std::cerr << "[createthread-1175f8] SUCCEEDED path reached" << std::endl;
+        }
+    }
+
+    if (targetPc == 0x1211f0u)
+    {
+        static std::atomic<uint32_t> s_logged1211f0{0u};
+        const uint32_t n = s_logged1211f0.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 5u)
+        {
+            uint32_t val = 0xdeadbeefu;
+            if (rdram)
+            {
+                std::memcpy(&val, rdram + 0x392630u, sizeof(val));
+            }
+            std::cerr << "[call-0x1211f0] #" << std::dec << n
+                      << " a0=0x" << std::hex << getRegU32(ctx, 4)
+                      << " [0x392630]=0x" << val
+                      << " isNegative=" << (static_cast<int32_t>(val) < 0)
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x121078u)
+    {
+        static std::atomic<uint32_t> s_logged121078{0u};
+        const uint32_t n = s_logged121078.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 5u)
+        {
+            const uint32_t t3Mode = m_memory.readIORegister(0x10001810u);
+            std::cerr << "[call-0x121078] #" << std::dec << n
+                      << " t3Mode=0x" << std::hex << t3Mode
+                      << " cmpeBit=" << ((t3Mode & 0x100u) != 0u)
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x135780u && sourcePc == 0x160ba0u)
+    {
+        static std::atomic<bool> s_loggedBranchNotTaken{false};
+        bool expected = false;
+        if (s_loggedBranchNotTaken.compare_exchange_strong(expected, true))
+        {
+            std::cerr << "[branch-160b90-NOT-taken] s0(a1 here)=0x" << std::hex << getRegU32(ctx, 5)
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x164cd0u && sourcePc == 0x160b88u)
+    {
+        static std::atomic<bool> s_loggedS0{false};
+        bool expected = false;
+        if (s_loggedS0.compare_exchange_strong(expected, true))
+        {
+            std::cerr << "[func137010-retval-via-s0] s0(a0 here)=0x" << std::hex << getRegU32(ctx, 4)
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x137010u && sourcePc == 0x160b7cu)
+    {
+        static std::atomic<bool> s_logged137010{false};
+        bool expected = false;
+        if (s_logged137010.compare_exchange_strong(expected, true))
+        {
+            uint32_t argListPtr = 0xdeadbeefu;
+            uint32_t deref92 = 0xdeadbeefu;
+            uint32_t deref92byte0 = 0xdeadbeefu;
+            if (rdram)
+            {
+                std::memcpy(&argListPtr, rdram + 0x3945d8u, sizeof(argListPtr));
+                if (argListPtr != 0u && argListPtr <= PS2_RAM_SIZE - 96u)
+                {
+                    std::memcpy(&deref92, rdram + argListPtr + 92u, sizeof(deref92));
+                    deref92byte0 = deref92 & 0xffu;
+                }
+            }
+            std::cerr << "[call-0x137010] a0=0x" << std::hex << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " *(0x3945d8)=0x" << argListPtr
+                      << " *(argListPtr+92)=0x" << deref92
+                      << " firstByte=0x" << deref92byte0
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x160b00u)
+    {
+        static std::atomic<bool> s_logged160b00{false};
+        bool expected = false;
+        if (s_logged160b00.compare_exchange_strong(expected, true))
+        {
+            std::cerr << "[call-0x160b00] a0=0x" << std::hex << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << std::dec << std::endl;
+        }
+    }
+
+    // EXPERIMENTAL FIX: 0x3D6FC0 is a fixed-size kernel-object pool descriptor
+    // (see project memory, 2026-08-25) that FUN_0012ae98's retry loop spins
+    // forever waiting on, via func_11A588 -> func_119FA8. Four exhaustive
+    // searches this session (absolute address, gp-relative address, raw ELF
+    // data, and a global value-range write watchpoint) found that NO game
+    // code anywhere ever writes to it. func_119FA8's exact shape (scan N
+    // fixed-size slots for a free one, encode claimed slots as
+    // (index<<16)|5) is generic, low-level kernel-object-pool bookkeeping,
+    // not application data -- the working theory is that this is
+    // infrastructure the real PS2 BIOS/kernel populates during its own
+    // startup, which this runtime skips entirely (it jumps straight to the
+    // game's ELF entry point). Pre-populate it here, once, right before
+    // FUN_0012ae98 is first reached (i.e. after the guest's own BSS-clear
+    // loop at entry_0x100008 has already run, so this write survives).
+    // Slot buffer placed at 0x3D7000, safely within the region this
+    // session's mem-scan confirmed is otherwise completely unused
+    // (0x3D4C50-0x3D8000). 64 slots * 64 bytes = 0x1000 bytes, and a
+    // zeroed buffer is already in the correct "all slots free" state
+    // (slot flags field bit0 == 0 means free), so only the pool header
+    // itself (listBase at +4, count at +8) needs writing.
+    if (targetPc == 0x12ae98u)
+    {
+        static std::atomic<bool> s_poolInitDone{false};
+        bool expected = false;
+        if (s_poolInitDone.compare_exchange_strong(expected, true))
+        {
+            constexpr uint32_t kPoolHeader = 0x3d6fc0u;
+            constexpr uint32_t kPoolSlots = 0x3d7000u;
+            constexpr uint32_t kPoolSlotCount = 64u;
+            if (rdram)
+            {
+                uint32_t listBase = kPoolSlots;
+                uint32_t count = kPoolSlotCount;
+                std::memcpy(rdram + kPoolHeader + 4u, &listBase, sizeof(listBase));
+                std::memcpy(rdram + kPoolHeader + 8u, &count, sizeof(count));
+                std::cerr << "[pool-init-fix] wrote listBase=0x" << std::hex << listBase
+                          << " count=" << std::dec << count
+                          << " at pool 0x" << std::hex << kPoolHeader << std::dec << std::endl;
+            }
+        }
+    }
+
+    if (targetPc == 0x12ae98u)
+    {
+        static std::atomic<bool> s_dumped{false};
+        bool expected = false;
+        if (s_dumped.compare_exchange_strong(expected, true))
+        {
+            constexpr uint32_t kDumpStart = 0x3d0000u;
+            constexpr uint32_t kDumpEnd = 0x3d8000u;
+            std::cerr << "[mem-scan] scanning 0x" << std::hex << kDumpStart
+                      << "-0x" << kDumpEnd << std::dec << std::endl;
+            bool inRun = false;
+            uint32_t runStart = 0u;
+            for (uint32_t addr = kDumpStart; addr < kDumpEnd; addr += 16u)
+            {
+                if (!rdram || addr > PS2_RAM_SIZE - 16u)
+                {
+                    break;
+                }
+                uint32_t words[4] = {0, 0, 0, 0};
+                std::memcpy(words, rdram + addr, sizeof(words));
+                const bool nonzero = (words[0] || words[1] || words[2] || words[3]);
+                if (nonzero && !inRun)
+                {
+                    inRun = true;
+                    runStart = addr;
+                }
+                else if (!nonzero && inRun)
+                {
+                    inRun = false;
+                    std::cerr << "[mem-scan] populated 0x" << std::hex << runStart
+                               << "-0x" << addr << std::dec << std::endl;
+                }
+            }
+            if (inRun)
+            {
+                std::cerr << "[mem-scan] populated 0x" << std::hex << runStart
+                           << "-0x" << kDumpEnd << std::dec << std::endl;
+            }
+            std::cerr << "[mem-scan] done" << std::endl;
+            std::cerr << "[gp-at-12ae98] gp=0x" << std::hex << getRegU32(ctx, 28) << std::dec << std::endl;
+
+            if (m_eeScheduler)
+            {
+                m_eeScheduler->debugDumpIrqHandlers();
+                const EeKernelSnapshot snap = m_eeScheduler->snapshot();
+                std::cerr << "[thread-dump] runningThreadId=" << snap.runningThreadId
+                          << " threadCount=" << snap.threads.size() << std::endl;
+                for (const EeThreadSnapshot &t : snap.threads)
+                {
+                    std::cerr << "[thread-dump] id=" << t.id
+                              << " status=" << static_cast<int>(t.status)
+                              << " pc=0x" << std::hex << t.pc
+                              << " entry=0x" << t.entry
+                              << std::dec
+                              << " prio=" << t.currentPriority
+                              << " waitReason=" << static_cast<int>(t.waitReason)
+                              << " waitId=" << t.waitId
+                              << std::endl;
+                }
+            }
+        }
+    }
+
+    if (sourcePc == 0x100e14u)
+    {
+        static std::atomic<uint64_t> s_initTableCallCount{0u};
+        const uint64_t n = s_initTableCallCount.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 200u)
+        {
+            std::cerr << "[init-table-call] #" << std::dec << n
+                      << " target=0x" << std::hex << targetPc
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x1211d0u)
+    {
+        static std::atomic<uint64_t> s_targetCallCount{0u};
+        const uint64_t n = s_targetCallCount.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 30u)
+        {
+            std::cerr << "[call-0x1211d0] #" << std::dec << n
+                      << " source=0x" << std::hex << sourcePc
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x119fa8u)
+    {
+        static std::atomic<uint64_t> s_poolAllocCount{0u};
+        const uint64_t n = s_poolAllocCount.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 15u)
+        {
+            uint32_t poolCount = 0xdeadbeefu;
+            uint32_t poolListBase = 0xdeadbeefu;
+            const uint32_t poolPtr = getRegU32(ctx, 4) & 0x1FFFFFFFu;
+            if (rdram && poolPtr <= PS2_RAM_SIZE - sizeof(uint32_t) - 8u)
+            {
+                std::memcpy(&poolCount, rdram + poolPtr + 8u, sizeof(uint32_t));
+                std::memcpy(&poolListBase, rdram + poolPtr + 4u, sizeof(uint32_t));
+            }
+            std::cerr << "[pool-alloc-0x119fa8] #" << std::dec << n
+                      << " poolPtr=0x" << std::hex << poolPtr
+                      << " count=0x" << poolCount
+                      << " listBase=0x" << poolListBase
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x121790u)
+    {
+        static std::atomic<uint64_t> s_fun121790CallCount{0u};
+        const uint64_t n = s_fun121790CallCount.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 30u)
+        {
+            std::cerr << "[call-0x121790] #" << std::dec << n
+                      << " source=0x" << std::hex << sourcePc
+                      << " kind=" << static_cast<int>(kind)
+                      << " name=" << (debugName ? debugName : "?")
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << std::dec << std::endl;
+        }
+    }
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
@@ -1327,6 +2536,29 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (!hasFunction(targetPc))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+        }
+
+        // DIAGNOSTIC (see project memory, 2026-08-26): a Return (jr $ra) to
+        // target 0 with ra==0 is DQ8's convention for "this thread's
+        // top-level function is done, terminate" -- but if this happens
+        // while nested inside a synchronous C++ call (targetFn(...) at
+        // ~line 2101 below), the IMMEDIATE OUTER CALLER's own generated code
+        // unconditionally overwrites ctx->pc with its own known fallthrough
+        // address right after the nested call returns, silently erasing
+        // this signal before the scheduler's top-level loop ever sees
+        // ctx->pc==0. Log the current nesting depth to determine whether
+        // this specific occurrence is at the true outermost level (where it
+        // would correctly propagate) or buried mid-chain (where it would be
+        // masked and NOT actually terminate the thread).
+        if (kind == GuestBranchKind::Return && targetPc == 0u && m_eeScheduler &&
+            m_eeScheduler->currentThreadId() == 1)
+        {
+            static std::atomic<uint32_t> s_loggedReturnToZero{0u};
+            if (s_loggedReturnToZero.fetch_add(1u, std::memory_order_relaxed) < 20u)
+            {
+                std::cerr << "[return-to-zero] source=0x" << std::hex << sourcePc << std::dec
+                          << " nestedCallDepth=" << m_nestedCallDepth << std::endl;
+            }
         }
 
         ctx->pc = targetPc;
@@ -1356,7 +2588,191 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint32_t sceSifGetRegArg0 = (targetPc == 0x116c30u) ? getRegU32(ctx, 4) : 0u;
+    uint32_t cachedClientAt391040Before = 0u;
+    if (targetPc == 0x11f020u && rdram)
+    {
+        std::memcpy(&cachedClientAt391040Before, rdram + 0x391040u, sizeof(cachedClientAt391040Before));
+    }
+    uint32_t memcmpA0Before = 0u, memcmpA1Before = 0u, memcmpA2Before = 0u;
+    uint32_t memcmpBuf0Before = 0u, memcmpBuf1Before = 0u;
+    if (targetPc == 0x1325f8u && rdram)
+    {
+        memcmpA0Before = getRegU32(ctx, 4) & 0x1FFFFFFFu;
+        memcmpA1Before = getRegU32(ctx, 5) & 0x1FFFFFFFu;
+        memcmpA2Before = getRegU32(ctx, 6);
+        if (memcmpA0Before <= PS2_RAM_SIZE - 4u) { std::memcpy(&memcmpBuf0Before, rdram + memcmpA0Before, 4u); }
+        if (memcmpA1Before <= PS2_RAM_SIZE - 4u) { std::memcpy(&memcmpBuf1Before, rdram + memcmpA1Before, 4u); }
+    }
+    ++m_nestedCallDepth;
     targetFn(rdram, ctx, this);
+    --m_nestedCallDepth;
+
+    // FIX (see project memory, 2026-08-26): applied AFTER func_11A588
+    // returns (writing before the call gets silently overwritten by the
+    // function's own client-struct initialization -- confirmed empirically,
+    // see sif12bcd4ClientPtr's capture site above). Write the fake non-null
+    // SifRpcClientData_t::server pointer (offset 0x24) so the caller at
+    // 0x12bce0's `beqz $v1, retry` sees success instead of looping its
+    // whole delay+bind sequence forever.
+    if (sif12bcd4ClientPtr != 0u && rdram)
+    {
+        constexpr uint32_t kFakeSifServerData = 0x3d4d00u;
+        constexpr uint32_t kFakeSifServerDataSize = 128u;
+        static std::atomic<bool> s_fakeServerZeroed2{false};
+        bool expectedZeroed2 = false;
+        if (s_fakeServerZeroed2.compare_exchange_strong(expectedZeroed2, true))
+        {
+            std::memset(rdram + kFakeSifServerData, 0, kFakeSifServerDataSize);
+        }
+        if (sif12bcd4ClientPtr <= PS2_RAM_SIZE - 0x28u)
+        {
+            constexpr uint32_t serverFieldOffset = 0x24u;
+            uint32_t serverPtr = kFakeSifServerData;
+            std::memcpy(rdram + sif12bcd4ClientPtr + serverFieldOffset, &serverPtr, sizeof(serverPtr));
+            static std::atomic<uint32_t> s_loggedSif12bcd4Fix{0u};
+            if (s_loggedSif12bcd4Fix.fetch_add(1u, std::memory_order_relaxed) < 10u)
+            {
+                std::cerr << "[sifbind-12bcd4-server-fix] wrote server=0x" << std::hex << serverPtr
+                          << " at client+0x24=0x" << (sif12bcd4ClientPtr + serverFieldOffset)
+                          << std::dec << std::endl;
+            }
+        }
+    }
+
+    // EXPERIMENTAL FIX (see project memory, 2026-08-25): FUN_0011f120
+    // (called from FUN_0011f7f8, called from FUN_0011fa20, looped by
+    // FUN_00160b00) does a real memcmp([0x3D8C28], [0x390F6C], 4), where
+    // 0x390F6C is a fixed ELF constant equal to the ASCII bytes "3000" (a
+    // version string, confirmed via [chase-1325f8-call] diagnostic dump --
+    // little-endian word 0x30303033 = '3','0','0','0'). 0x3D8C28 is meant
+    // to hold a real IOP module-version response this runtime has no real
+    // IOP to provide, so it stays at its default zero and the comparison
+    // never matches, causing FUN_00160b00's retry loop to spin forever.
+    // Same fix pattern as the pool-init-fix: pre-populate the piece of
+    // state a real BIOS/IOP handshake would have set, once, before this
+    // loop can ever be reached (gated on FUN_001609c0's entry, which is
+    // this loop's own setup/caller function).
+    if (targetPc == 0x1609c0u)
+    {
+        static std::atomic<bool> s_moduleVersionSeeded{false};
+        bool expected = false;
+        if (s_moduleVersionSeeded.compare_exchange_strong(expected, true) && rdram)
+        {
+            uint32_t expectedVersion = 0u;
+            std::memcpy(&expectedVersion, rdram + 0x390f6cu, sizeof(expectedVersion));
+            std::memcpy(rdram + 0x3d8c28u, &expectedVersion, sizeof(expectedVersion));
+            std::cerr << "[module-version-fix] wrote 0x" << std::hex << expectedVersion
+                      << " to 0x3d8c28" << std::dec << std::endl;
+        }
+    }
+
+    // REVERTED EXPERIMENT (see project memory, 2026-08-27): tried seeding
+    // 0x3D8768 with the same "3000" constant, reasoning by analogy with the
+    // 0x3d8c28 fix above since func_11B8B0 also compares against 0x390F6C.
+    // WRONG: a direct diagnostic read at func_11B8B0's own entry point
+    // showed 0x3D8768 legitimately holds 0x8 (a real small integer written
+    // by some other, not-yet-identified piece of DQ8's own code) by the
+    // time the check runs, immediately after our seed -- meaning this is
+    // NOT an uninitialized "missing IOP response" slot like 0x3d8c28 is;
+    // it's unrelated state, and reusing the same ELF string constant in two
+    // places doesn't imply the same semantic purpose. Reverted rather than
+    // left in, since it reflected a false premise, not just an unproven one.
+
+    // DIAGNOSTIC: chase the new FUN_00160b00 stall (see project memory,
+    // 2026-08-25) -- capture v0 immediately after each synchronous nested
+    // call in the FUN_00160b00 -> FUN_0011fa20 -> FUN_0011f7f8 ->
+    // FUN_0011f020 chain to find exactly where the negative/failure value
+    // first appears, instead of guessing from static disassembly.
+    if (targetPc == 0x11fa20u && sourcePc == 0x160accu)
+    {
+        static std::atomic<uint32_t> s_n1{0u};
+        if (s_n1.fetch_add(1u, std::memory_order_relaxed) < 15u)
+        {
+            std::cerr << "[chase-160acc] FUN_0011fa20 returned v0=0x" << std::hex << getRegU32(ctx, 2) << std::dec << std::endl;
+        }
+    }
+    if (targetPc == 0x11f7f8u && sourcePc == 0x11fa2cu)
+    {
+        static std::atomic<uint32_t> s_n2{0u};
+        if (s_n2.fetch_add(1u, std::memory_order_relaxed) < 15u)
+        {
+            std::cerr << "[chase-11fa2c] FUN_0011f7f8 returned v0=0x" << std::hex << getRegU32(ctx, 2) << std::dec << std::endl;
+        }
+    }
+    if (targetPc == 0x11f020u && sourcePc == 0x11f828u)
+    {
+        static std::atomic<uint32_t> s_n3{0u};
+        if (s_n3.fetch_add(1u, std::memory_order_relaxed) < 15u)
+        {
+            std::cerr << "[chase-11f828] FUN_0011f020 cachedBefore=0x" << std::hex << cachedClientAt391040Before
+                      << " returned v0=0x" << getRegU32(ctx, 2) << std::dec << std::endl;
+        }
+    }
+    if (targetPc == 0x1325f8u && rdram)
+    {
+        static std::atomic<uint32_t> s_n4{0u};
+        if (s_n4.fetch_add(1u, std::memory_order_relaxed) < 20u)
+        {
+            std::cerr << "[chase-1325f8-call] source=0x" << std::hex << sourcePc
+                      << " a0=0x" << memcmpA0Before << " *a0=0x" << memcmpBuf0Before
+                      << " a1=0x" << memcmpA1Before << " *a1=0x" << memcmpBuf1Before
+                      << " a2=0x" << memcmpA2Before
+                      << " result_v0=0x" << getRegU32(ctx, 2)
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x116c20u)
+    {
+        static std::atomic<uint32_t> s_loggedSifSetReg{0u};
+        const uint32_t n = s_loggedSifSetReg.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 20u)
+        {
+            std::cerr << "[sceSifSetReg-call] #" << std::dec << n
+                      << " source=0x" << std::hex << sourcePc
+                      << " reg=0x" << getRegU32(ctx, 4)
+                      << " value=0x" << getRegU32(ctx, 5)
+                      << std::dec << std::endl;
+        }
+    }
+
+    // DIAGNOSTIC: verify the kSifBootReadyMask fix (see project memory,
+    // 2026-08-25) actually changed what DQ8 observes from sceSifGetReg(4).
+    if (targetPc == 0x116c30u && sourcePc == 0x11ff08u)
+    {
+        static std::atomic<uint32_t> s_loggedSifGetRegBoot{0u};
+        const uint32_t n = s_loggedSifGetRegBoot.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 10u)
+        {
+            std::cerr << "[sifgetreg-boot-check] #" << std::dec << n
+                      << " reg=0x" << std::hex << sceSifGetRegArg0
+                      << " v0=0x" << getRegU32(ctx, 2)
+                      << std::dec << std::endl;
+        }
+    }
+
+    // DIAGNOSTIC: capture func_11A588's actual return value (v0) the instant
+    // its synchronous nested call above returns to FUN_0012ae98's call site
+    // (source=0x12af64). This replaces an earlier, flawed "wait for the next
+    // dispatch outside func_11A588's range" heuristic that misfired on a
+    // fresh re-entry into func_11A588 (via its own internal func_119FA8
+    // call) and captured unrelated internal state instead of the true
+    // return value. Because DirectCall targets are invoked synchronously
+    // right here (this line), v0 immediately after targetFn() returns is
+    // unambiguously what the caller (FUN_0012ae98) sees.
+    if (targetPc == 0x11a588u && sourcePc == 0x12af64u)
+    {
+        static std::atomic<uint32_t> s_loggedRealReturn{0u};
+        const uint32_t n = s_loggedRealReturn.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 20u)
+        {
+            std::cerr << "[func11a588-real-return] #" << std::dec << n
+                      << " v0=0x" << std::hex << getRegU32(ctx, 2)
+                      << " pcAfter=0x" << ctx->pc
+                      << std::dec << std::endl;
+        }
+    }
 
     if (isStopRequested() || ctx->pc == 0u)
     {
@@ -1428,6 +2844,47 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
     const uint32_t syscallId = (encodedSyscallId != 0u)
                                    ? encodedSyscallId
                                    : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
+
+    {
+        static std::atomic<uint32_t> s_syscallLogCount{0u};
+        const uint32_t idx = s_syscallLogCount.fetch_add(1u, std::memory_order_relaxed);
+        if (idx < 400u)
+        {
+            std::cerr << "[syscall] #" << std::dec << idx
+                      << " id=0x" << std::hex << syscallId
+                      << " encoded=0x" << encodedSyscallId
+                      << " pc=0x" << ctx->pc
+                      << std::dec << std::endl;
+        }
+
+        if (syscallId == 0x83u)
+        {
+            static std::atomic<uint32_t> s_findAddrCallCount{0u};
+            static std::atomic<int64_t> s_findAddrLastLogMs{0};
+            const uint32_t callIdx = s_findAddrCallCount.fetch_add(1u, std::memory_order_relaxed);
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+            int64_t last = s_findAddrLastLogMs.load(std::memory_order_relaxed);
+            if (callIdx < 5u ||
+                (nowMs - last >= 500 &&
+                 s_findAddrLastLogMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed)))
+            {
+                constexpr uint32_t kMirrorAddr = (0x80011F80u & 0x1FFFFFFFu) + 0x83u * 4u;
+                uint32_t mirrorValue = 0xDEADBEEFu;
+                if (rdram)
+                {
+                    std::memcpy(&mirrorValue, rdram + kMirrorAddr, sizeof(mirrorValue));
+                }
+                std::cerr << "[find-addr-call] call#" << std::dec << callIdx
+                          << " a0(start)=0x" << std::hex << getRegU32(ctx, 4)
+                          << " a1(end)=0x" << getRegU32(ctx, 5)
+                          << " a2(target)=0x" << getRegU32(ctx, 6)
+                          << " mirror[0x" << kMirrorAddr << "]=0x" << mirrorValue
+                          << std::dec << std::endl;
+            }
+        }
+    }
 
     if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
     {
@@ -2164,6 +3621,36 @@ const EeScheduler &PS2Runtime::eeScheduler() const
     return *m_eeScheduler;
 }
 
+Ps2DiscFs *PS2Runtime::discFs()
+{
+    if (!m_discFsOpenAttempted)
+    {
+        m_discFsOpenAttempted = true;
+        // Hardcoded path, matching this session's established pattern of
+        // hardcoded constants where no config system exists yet (see
+        // project memory 2026-08-27). Validated standalone against this
+        // exact ISO before integration: SLUS_212.07 read back byte-for-byte
+        // identical to the known-good extracted copy, SYSTEM.CNF read
+        // correctly, and MODULES/CDVDSTM.IRX located via directory
+        // traversal with the exact expected size.
+        constexpr const char *kDq8IsoPath =
+            "C:\\Users\\liorv\\Downloads\\Dragon Quest VIII - Journey of the Cursed King (USA)\\Dragon Quest VIII - Journey of the Cursed King (USA).iso";
+        m_discFs = Ps2DiscFs::Open(kDq8IsoPath);
+        if (m_discFs)
+        {
+            uint32_t lba = 0, size = 0;
+            const bool located = m_discFs->Locate("SLUS_212.07", lba, size);
+            std::cerr << "[disc-fs] opened DQ8 ISO successfully; SLUS_212.07 located="
+                      << located << " lba=" << lba << " size=" << size << std::endl;
+        }
+        else
+        {
+            std::cerr << "[disc-fs] FAILED to open DQ8 ISO at " << kDq8IsoPath << std::endl;
+        }
+    }
+    return m_discFs.get();
+}
+
 void PS2Runtime::postEeEvent(EeEvent event)
 {
     m_eeScheduler->postEvent(event);
@@ -2171,7 +3658,19 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    const bool due = m_eeScheduler->checkpointDue(cycles);
+    if (due)
+    {
+        static std::atomic<uint32_t> s_loggedEeCheckpointDue{0u};
+        if (s_loggedEeCheckpointDue.fetch_add(1u, std::memory_order_relaxed) < 30u)
+        {
+            std::cerr << "[eeCheckpointDue-true] pc=0x" << std::hex
+                      << (m_eeScheduler->currentContext() ? m_eeScheduler->currentContext()->pc : 0u)
+                      << std::dec << " threadId=" << m_eeScheduler->currentThreadId()
+                      << std::endl;
+        }
+    }
+    return due;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
@@ -2404,6 +3903,23 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+
+        // DIAGNOSTIC (see project memory, 2026-08-25): periodically dump a
+        // screenshot to see what DQ8 is actually rendering at this point in
+        // boot -- visual ground truth for whether it has reached a genuine
+        // idle/title-screen state versus a blank/broken one.
+        {
+            static std::atomic<int64_t> s_lastScreenshotMs{0};
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+            int64_t last = s_lastScreenshotMs.load(std::memory_order_relaxed);
+            if (nowMs - last >= 5000 &&
+                s_lastScreenshotMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed))
+            {
+                TakeScreenshot("dq8_r5900/screenshot_latest.png");
+            }
+        }
 
         if (WindowShouldClose())
         {

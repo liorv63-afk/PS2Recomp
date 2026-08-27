@@ -2,8 +2,13 @@
 #include "Sync.h"
 #include "runtime/ee_scheduler.h"
 
+#include <atomic>
+#include <iostream>
+
 namespace ps2_syscalls
 {
+    static std::atomic<int> s_dq8OpenWaitSemId{-1};
+
     namespace
     {
         constexpr uint32_t WEF_OR = 0x01u;
@@ -36,7 +41,28 @@ namespace ps2_syscalls
                                  bool interruptSafe)
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
-            const int result = ee.signalSemaphore(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+            const int semId = static_cast<int>(getRegU32(ctx, 4));
+            const int result = ee.signalSemaphore(semId, interruptSafe);
+            {
+                static std::atomic<uint32_t> s_signalSemaLogCount{0u};
+                if ((semId == 3 || semId == 37 || semId == 58 || semId == 67) &&
+                    s_signalSemaLogCount.fetch_add(1u, std::memory_order_relaxed) < 200u)
+                {
+                    std::cerr << "[SignalSema-target] id=" << semId << " result=" << result
+                              << " interruptSafe=" << interruptSafe
+                              << " callerThreadId=" << ee.currentThreadId()
+                              << " callerPc=0x" << std::hex << ctx->pc << std::dec << std::endl;
+                }
+                static std::atomic<uint32_t> s_dq8OpenSignalLogCount{0u};
+                if (semId == s_dq8OpenWaitSemId.load(std::memory_order_relaxed) &&
+                    s_dq8OpenSignalLogCount.fetch_add(1u, std::memory_order_relaxed) < 200u)
+                {
+                    std::cerr << "[dq8-open-signalsema] id=" << semId << " result=" << result
+                              << " interruptSafe=" << interruptSafe
+                              << " callerThreadId=" << ee.currentThreadId()
+                              << " callerPc=0x" << std::hex << ctx->pc << std::dec << std::endl;
+                }
+            }
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
         }
@@ -78,12 +104,22 @@ namespace ps2_syscalls
 
         // ee_sema_t from ps2sdk. The IOP attr/option/init/max ordering is not
         // accepted by the EE runtime.
-        setReturnS32(ctx,
-                     scheduler(rdram, ctx, runtime)
-                         .createSemaphore(param->init_count,
-                                          param->max_count,
-                                          param->attr,
-                                          param->option));
+        const int semId = scheduler(rdram, ctx, runtime)
+                               .createSemaphore(param->init_count,
+                                                 param->max_count,
+                                                 param->attr,
+                                                 param->option);
+        {
+            static std::atomic<uint32_t> s_createSemaLogCount{0u};
+            if (s_createSemaLogCount.fetch_add(1u, std::memory_order_relaxed) < 20u)
+            {
+                std::cerr << "[CreateSema] paramAddr=0x" << std::hex << address
+                          << " initCount=" << std::dec << param->init_count
+                          << " maxCount=" << param->max_count
+                          << " -> id=" << semId << std::endl;
+            }
+        }
+        setReturnS32(ctx, semId);
     }
 
     void DeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -108,7 +144,25 @@ namespace ps2_syscalls
 
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        scheduler(rdram, ctx, runtime).waitSemaphore(static_cast<int>(getRegU32(ctx, 4)));
+        const int semId = static_cast<int>(getRegU32(ctx, 4));
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        {
+            static std::atomic<uint32_t> s_waitSemaLogCount{0u};
+            if ((semId == 3 || semId == 37 || semId == 58 || semId == 67) &&
+                s_waitSemaLogCount.fetch_add(1u, std::memory_order_relaxed) < 200u)
+            {
+                std::cerr << "[WaitSema-target] id=" << semId
+                          << " callerThreadId=" << ee.currentThreadId()
+                          << " callerPc=0x" << std::hex << ctx->pc << std::dec << std::endl;
+            }
+            if (ctx->pc == 0x11bdacu)
+            {
+                s_dq8OpenWaitSemId.store(semId, std::memory_order_relaxed);
+                std::cerr << "[dq8-open-waitsema] id=" << semId
+                          << " callerThreadId=" << ee.currentThreadId() << std::endl;
+            }
+        }
+        ee.waitSemaphore(semId);
     }
 
     void PollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

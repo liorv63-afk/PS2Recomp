@@ -70,6 +70,7 @@
     X(AddDmacHandler)          \
     X(AddDmacHandler2)         \
     X(RemoveDmacHandler)       \
+    X(LinkedIntcHandlerBridge) \
     X(EnableIntc)              \
     X(iEnableIntc)             \
     X(DisableIntc)             \
@@ -82,6 +83,8 @@
     X(SifStopModule)           \
     X(SifLoadModule)           \
     X(SifInitRpc)              \
+    X(SifInitRpcDirectCallBridge) \
+    X(Dq8EntityWaitBridge)     \
     X(SifBindRpc)              \
     X(SifCallRpc)              \
     X(SifRegisterRpc)          \

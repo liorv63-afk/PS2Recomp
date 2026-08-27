@@ -18,6 +18,7 @@
 #include <array>
 #include <mutex>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,6 +32,7 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
 #include "ps2x/iop/iop_types.h"
+#include "ps2_disc_fs.h"
 
 namespace ps2x::iop
 {
@@ -243,12 +245,131 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
     (void)size;
     (void)valueLo;
     (void)valueHi;
     (void)op;
-    (void)ctx;
+
+    // Temporary watchpoint: log any write touching the DQ8 IOP-ready poll flag
+    // at 0x3d5740 (see project memory) so we can see what, if anything, ever
+    // sets it and from where.
+    if (guestAddr >= 0x3d5740u && guestAddr < 0x3d5750u)
+    {
+        static std::atomic<uint32_t> s_watchLogCount{0u};
+        if (s_watchLogCount.fetch_add(1u, std::memory_order_relaxed) < 100u)
+        {
+            std::cerr << "[watch-3d5740] addr=0x" << std::hex << guestAddr
+                      << " size=" << std::dec << size
+                      << " valueLo=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << std::dec << std::endl;
+        }
+    }
+    // Temporary watchpoint (2026-08-27): what writes 0x3D8768 to the value
+    // 0x8 observed at func_11B8B0's check-time? Known writers so far:
+    // FUN_0011b940 zeroes it (via func_132848, a memset-style call) as part
+    // of a filesystem close/reset; nothing else was found via static
+    // literal-address search (lui 0x3D/0x3E + matching addiu), meaning the
+    // real writer likely uses $gp-relative addressing or a long-lived cached
+    // base register this session's grep technique can't find statically.
+    if (guestAddr >= 0x3d8760u && guestAddr < 0x3d8780u)
+    {
+        static std::atomic<uint32_t> s_watch3d8768LogCount{0u};
+        if (s_watch3d8768LogCount.fetch_add(1u, std::memory_order_relaxed) < 200u)
+        {
+            std::cerr << "[watch-3d8768] addr=0x" << std::hex << guestAddr
+                      << " size=" << std::dec << size
+                      << " valueLo=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      // s0 (reg16) got REPURPOSED partway through func_11B6A8
+                      // (confirmed: client+0/+4 don't match the observed 0x8
+                      // -- the same register-liveness trap this session hit
+                      // before in a different function). Logging s0's LIVE
+                      // value here (at write-time) to find its real source
+                      // address, since static tracing already got this wrong
+                      // once.
+                      << " s0(reg16)=0x" << (ctx ? getRegU32(ctx, 16) : 0u)
+                      << std::dec << std::endl;
+        }
+    }
+    // Temporary watchpoint: log any write touching the fixed-size pool
+    // descriptor at 0x3d6fc0 (list base at +4, slot count at +8) that
+    // FUN_0012ae98's retry loop keeps finding uninitialized (see project
+    // memory, 2026-08-25). Widened past +0x20 to catch nearby struct writes.
+    if (guestAddr >= 0x3d6fc0u && guestAddr < 0x3d6fe0u)
+    {
+        static std::atomic<uint32_t> s_watchPoolLogCount{0u};
+        if (s_watchPoolLogCount.fetch_add(1u, std::memory_order_relaxed) < 100u)
+        {
+            std::cerr << "[watch-3d6fc0] addr=0x" << std::hex << guestAddr
+                      << " size=" << std::dec << size
+                      << " valueLo=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << std::dec << std::endl;
+        }
+    }
+    // Temporary watchpoint: catch any write ANYWHERE in guest memory whose
+    // *value* (not address) falls within the 0x3d6fc0 pool's own struct
+    // range. This is looking for an indirect chain -- e.g. some other code
+    // storing a pointer TO this pool into a registry/table elsewhere -- that
+    // a pure address-pattern search (see project memory, 2026-08-25) cannot
+    // find, since the pool's address may never appear as a literal immediate
+    // anywhere in the instruction stream if it's only ever produced by
+    // pointer arithmetic on some other already-computed base.
+    {
+        const uint32_t lo32 = static_cast<uint32_t>(valueLo);
+        if (lo32 >= 0x3d6fc0u && lo32 < 0x3d6fe0u)
+        {
+            static std::atomic<uint32_t> s_watchPoolValueLogCount{0u};
+            if (s_watchPoolValueLogCount.fetch_add(1u, std::memory_order_relaxed) < 100u)
+            {
+                std::cerr << "[watch-value-3d6fc0] wroteAddr=0x" << std::hex << guestAddr
+                          << " size=" << std::dec << size
+                          << " value=0x" << std::hex << lo32
+                          << " pc=0x" << (ctx ? ctx->pc : 0u)
+                          << std::dec << std::endl;
+            }
+        }
+    }
+    // Temporary watchpoint (see project memory, 2026-08-26): FUN_001690e0
+    // (the boot orchestrator) makes a blocking call into an entity/queue
+    // processor for the struct at 0x3F17B0 (checked field at +4+0x14 =
+    // 0x3F17C8) and never returns because that field never becomes
+    // nonzero -- this is the current single blocking point for the whole
+    // boot sequence. Log any write touching this struct to find whoever,
+    // if anyone, is supposed to populate it.
+    if (guestAddr >= 0x3f17b0u && guestAddr < 0x3f17e0u)
+    {
+        // The one write that actually matters: the dispatch field at
+        // 0x3f17c8 becoming nonzero. Log this unconditionally, uncapped --
+        // it should be rare/never, so there's no volume risk, and missing
+        // it due to a shared cap being exhausted by routine reset noise
+        // (confirmed happening in the capped version) would defeat the
+        // whole point of this watchpoint.
+        if (guestAddr == 0x3f17c8u && valueLo != 0u)
+        {
+            std::cerr << "[watch-3f17c8-NONZERO] size=" << std::dec << size
+                      << " valueLo=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << std::dec << std::endl;
+        }
+        static std::atomic<uint32_t> s_watchEntityLogCount{0u};
+        static std::atomic<int64_t> s_watchEntityLastLogMs{0};
+        const auto nowMsEntity = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count();
+        int64_t lastEntity = s_watchEntityLastLogMs.load(std::memory_order_relaxed);
+        if (nowMsEntity - lastEntity >= 200 &&
+            s_watchEntityLastLogMs.compare_exchange_strong(lastEntity, nowMsEntity, std::memory_order_relaxed))
+        {
+            const uint32_t n = s_watchEntityLogCount.fetch_add(1u, std::memory_order_relaxed);
+            std::cerr << "[watch-3f17b0] #" << n << " addr=0x" << std::hex << guestAddr
+                      << " size=" << std::dec << size
+                      << " valueLo=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << std::dec << std::endl;
+        }
+    }
     // TODO we dont need this anymore so on next release it will be deleted
 }
 
@@ -381,6 +502,11 @@ public:
 
     EeScheduler &eeScheduler();
     const EeScheduler &eeScheduler() const;
+    // Lazily opens the real DQ8 disc image on first call (see project memory
+    // 2026-08-27: validated standalone against the real ISO before this
+    // integration). Returns nullptr if the disc image isn't found/valid.
+    // Path is hardcoded for now -- no config system exists yet for this.
+    Ps2DiscFs *discFs();
     void postEeEvent(EeEvent event);
     bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
     [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
@@ -482,6 +608,9 @@ private:
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;
     std::unique_ptr<EeScheduler> m_eeScheduler;
+    int m_nestedCallDepth = 0;
+    std::unique_ptr<Ps2DiscFs> m_discFs;
+    bool m_discFsOpenAttempted = false;
     mutable std::mutex m_eeKernelStateMutex;
     std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;
     std::unordered_map<uint32_t, uint32_t> m_eeSyscallOverrides;
