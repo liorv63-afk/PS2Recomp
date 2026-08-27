@@ -2254,6 +2254,70 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                               << " signalResult=" << signalResult << std::endl;
                 }
             }
+            // FIX (see project memory, 2026-08-27): a THIRD call shape,
+            // rpc_number==2, reached from the code right after func_11C1F0
+            // (send_size=0x20, recv_size=4, same client=0x3d8740/recv_buf=
+            // 0x3d7c80/send_buf=0x3d7040 convention as open/read). Traced
+            // its caller in full: it registers a free slot in a 32-entry
+            // request table at 0x390F98 (previously misidentified as a
+            // "retry-budget counter" -- it's actually a general pending-SIF-
+            // request slot registry, unrelated to the open/read investigation
+            // that first found it), makes this call, checks recv_buf is
+            // nonzero via the same uncached-alias trick used by open/read,
+            // then WaitSema's on an embedded semaphore only if the found
+            // slot index was 0. Same fix shape as the read: acknowledge with
+            // a non-negative nonzero reply and signal the embedded
+            // semaphore. Real semantics of this specific call are not yet
+            // understood beyond "same family as open/read" -- watch for
+            // whether a bare acknowledgement is sufficient here too, the way
+            // it eventually proved insufficient for the read.
+            else if (recvSize == 4u && rpcNumber == 2u && recvBuf == 0x3d7c80u)
+            {
+                constexpr uint32_t kThirdCallSendBuf = 0x3D7040u;
+                uint32_t semToSignal = 0u;
+                std::memcpy(&semToSignal, rdram + kThirdCallSendBuf, sizeof(semToSignal));
+                const int32_t reply = 1;
+                std::memcpy(rdram + recvBuf, &reply, sizeof(reply));
+                static std::atomic<uint32_t> s_loggedThirdCallReply{0u};
+                if (s_loggedThirdCallReply.fetch_add(1u, std::memory_order_relaxed) < 100u)
+                {
+                    std::cerr << "[sifcall-rpc2-reply] semToSignal=" << semToSignal << std::endl;
+                }
+                if (semToSignal != 0u && m_eeScheduler)
+                {
+                    const int signalResult =
+                        m_eeScheduler->signalSemaphore(static_cast<int>(semToSignal), false);
+                    std::cerr << "[sifcall-rpc2-signal] semId=" << semToSignal
+                              << " signalResult=" << signalResult << std::endl;
+                }
+            }
+            // FIX (see project memory, 2026-08-27): a FOURTH call shape,
+            // rpc_number==1 (send_size=0x14 this time), found immediately
+            // after investigating the rpc_number==2 wait -- same
+            // client/recv_buf/send_buf family, same "create sema, embed id
+            // at send_buf+0x0, wait on it after checking recv_buf nonzero
+            // via the uncached alias" structure as rpc_number==2 and the
+            // read. Same fix.
+            else if (recvSize == 4u && rpcNumber == 1u && recvBuf == 0x3d7c80u)
+            {
+                constexpr uint32_t kFourthCallSendBuf = 0x3D7040u;
+                uint32_t semToSignal = 0u;
+                std::memcpy(&semToSignal, rdram + kFourthCallSendBuf, sizeof(semToSignal));
+                const int32_t reply = 1;
+                std::memcpy(rdram + recvBuf, &reply, sizeof(reply));
+                static std::atomic<uint32_t> s_loggedFourthCallReply{0u};
+                if (s_loggedFourthCallReply.fetch_add(1u, std::memory_order_relaxed) < 100u)
+                {
+                    std::cerr << "[sifcall-rpc1-reply] semToSignal=" << semToSignal << std::endl;
+                }
+                if (semToSignal != 0u && m_eeScheduler)
+                {
+                    const int signalResult =
+                        m_eeScheduler->signalSemaphore(static_cast<int>(semToSignal), false);
+                    std::cerr << "[sifcall-rpc1-signal] semId=" << semToSignal
+                              << " signalResult=" << signalResult << std::endl;
+                }
+            }
             // EXPERIMENTAL GENERALIZATION (2026-08-27): other call shapes
             // exist beyond the recv_size==8 streaming-read pattern (e.g. a
             // client seen with send_size=recv_size=0x80, and others with

@@ -155,10 +155,11 @@ namespace ps2_syscalls
                           << " callerThreadId=" << ee.currentThreadId()
                           << " callerPc=0x" << std::hex << ctx->pc << std::dec << std::endl;
             }
-            if (ctx->pc == 0x11bdacu)
+            if (ctx->pc == 0x11bdacu || ctx->pc == 0x11c420u)
             {
                 s_dq8OpenWaitSemId.store(semId, std::memory_order_relaxed);
                 std::cerr << "[dq8-open-waitsema] id=" << semId
+                          << " callerPc=0x" << std::hex << ctx->pc << std::dec
                           << " callerThreadId=" << ee.currentThreadId() << std::endl;
             }
         }
