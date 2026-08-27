@@ -391,6 +391,23 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
+    // Temporary watchpoint (2026-08-27): trace the full lifecycle of the
+    // global retry-budget-looking counter at 0x390F98 (read/negated inside
+    // FUN_0011bfb0 at 0x11c0b8/0x11c2fc, feeding func_11B010's stack-passed
+    // "clean success" return value) -- does it ever get reset, what writes
+    // it, and is its currently-exhausted (-11) state something our own
+    // fixes indirectly caused or a pre-existing condition.
+    if (guestAddr >= 0x390f98u && guestAddr < 0x390f9cu)
+    {
+        static std::atomic<uint32_t> s_watch390f98LogCount{0u};
+        if (s_watch390f98LogCount.fetch_add(1u, std::memory_order_relaxed) < 200u)
+        {
+            std::cerr << "[watch-390f98] size=" << std::dec << size
+                      << " valueLo=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << std::dec << std::endl;
+        }
+    }
     // TODO we dont need this anymore so on next release it will be deleted
 }
 

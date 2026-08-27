@@ -1314,6 +1314,19 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+namespace
+{
+// Cache of the last successfully-opened DQ8 file's real lba/size (see
+// project memory, 2026-08-27), set by the SIF open-reply fix and consumed
+// both by the SIF read-reply fix and the func_11C1F0 buffer-registration
+// hook below. Deliberately simple: scoped narrowly to this single
+// client/recv_buf chain, where open is always immediately followed by its
+// own read(s) with no interleaving of a different file -- confirmed via
+// live testing this session. Not a general per-file-descriptor cache.
+std::atomic<uint32_t> s_lastOpenedFileSize{0u};
+std::atomic<uint32_t> s_lastOpenedFileLba{0u};
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1801,6 +1814,54 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
+    // FIX (see project memory, 2026-08-27): func_11C1F0 registers a
+    // destination buffer (a1) and size (a2) for the just-opened file's real
+    // content, then only waits on an always-trivially-satisfied mutex
+    // (0x39102C, initCount=1) -- it never itself issues a SIF call, meaning
+    // it's designed to receive data delivered asynchronously by real IOP
+    // firmware (an unsolicited DMA into this registered buffer) that this
+    // runtime has no mechanism to produce, since we only intercept/answer
+    // DQ8's own direct SIF-call construction, not actual IOP execution.
+    // Confirmed via a live dump that neither of the two SIF read calls that
+    // precede this (FUN_0011bfb0, rpc_number==4) ever carry a real
+    // destination pointer -- field 0x10 of the shared send buffer stayed 0
+    // for both. This synthesizes that missing delivery directly: at the
+    // exact point the guest registers the buffer, copy the real disc bytes
+    // for the just-opened file (cached lba/size from the open-reply fix)
+    // straight into it via Ps2DiscFs.
+    if (targetPc == 0x11c1f0u && sourcePc == 0x164904u && rdram)
+    {
+        const uint32_t destBuf = getRegU32(ctx, 5) & 0x1FFFFFFFu;
+        const uint32_t destSize = getRegU32(ctx, 6);
+        const uint32_t lba = s_lastOpenedFileLba.load(std::memory_order_relaxed);
+        const uint32_t cachedSize = s_lastOpenedFileSize.load(std::memory_order_relaxed);
+        static std::atomic<uint32_t> s_loggedDataDeliveryCount{0u};
+        Ps2DiscFs *fs = (lba != 0u && cachedSize != 0u && destBuf != 0u &&
+                         destSize <= cachedSize && destBuf <= PS2_RAM_SIZE - destSize)
+                            ? discFs()
+                            : nullptr;
+        if (fs)
+        {
+            const std::vector<uint8_t> bytes = fs->ReadSectors(lba, destSize);
+            if (bytes.size() == destSize)
+            {
+                std::memcpy(rdram + destBuf, bytes.data(), destSize);
+            }
+            if (s_loggedDataDeliveryCount.fetch_add(1u, std::memory_order_relaxed) < 100u)
+            {
+                std::cerr << "[sifcall-data-delivery] destBuf=0x" << std::hex << destBuf
+                          << " destSize=0x" << destSize << " lba=" << std::dec << lba
+                          << " bytesCopied=" << bytes.size() << std::endl;
+            }
+        }
+        else if (s_loggedDataDeliveryCount.fetch_add(1u, std::memory_order_relaxed) < 100u)
+        {
+            std::cerr << "[sifcall-data-delivery-skip] destBuf=0x" << std::hex << destBuf
+                      << " destSize=0x" << destSize << " lba=0x" << lba
+                      << " cachedSize=0x" << cachedSize << std::dec << std::endl;
+        }
+    }
+
     // TEMPORARY DIAGNOSTIC (2026-08-27): which of the 4 known call sites
     // (0x100354, 0x1085bc, 0x162174, 0x1647e0) actually invokes FUN_0011bba8
     // (the open routine) during boot, and with what a0 (file-slot index
@@ -1956,14 +2017,6 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         {
             const uint32_t bufPtr = getRegU32(ctx, 16) & 0x1FFFFFFFu;
             uint32_t rpcNumber = 0u, sendSize = 0u, recvBuf = 0u, recvSize = 0u;
-            // Cache of the last successfully-opened file's real size (see
-            // project memory, 2026-08-27), set by the open-reply branch and
-            // consumed by the read-reply branch below. Deliberately simple:
-            // scoped narrowly to this single client/recv_buf chain, where
-            // open is always immediately followed by its own read(s) with no
-            // interleaving of a different file -- confirmed via live testing
-            // this session. Not a general per-file-descriptor cache.
-            static std::atomic<uint32_t> s_lastOpenedFileSize{0u};
             if (bufPtr <= PS2_RAM_SIZE - 0x30u)
             {
                 std::memcpy(&rpcNumber, rdram + bufPtr + 0x20u, sizeof(rpcNumber));
@@ -2101,6 +2154,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 if (found)
                 {
                     s_lastOpenedFileSize.store(size, std::memory_order_relaxed);
+                    s_lastOpenedFileLba.store(lba, std::memory_order_relaxed);
                     uint32_t destPtr = 0u;
                     std::memcpy(&destPtr, rdram + kOpenSendBuf + 0x4u, sizeof(destPtr));
                     destPtr &= 0x1FFFFFFFu;
@@ -2161,7 +2215,16 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 constexpr uint32_t kReadSendBuf = 0x3D7040u;
                 uint32_t semToSignal = 0u;
                 std::memcpy(&semToSignal, rdram + kReadSendBuf, sizeof(semToSignal));
-                const int32_t reply = 0;
+                // CORRECTED (see project memory, 2026-08-27): a literal 0
+                // reply passes func_11B010's own sign-bit success check but
+                // FAILS a second, separate check FUN_0011bfb0 performs right
+                // after -- it re-reads recv_buf through its uncached alias
+                // and requires the value to be NONZERO (bnez), taking a
+                // hardcoded -0xB error path otherwise. Confirmed live: with
+                // reply==0 this branch was always taken, producing -11
+                // despite func_11B010 itself returning a clean 0. Use 1
+                // (a plain non-negative, non-zero acknowledgement) instead.
+                const int32_t reply = 1;
                 std::memcpy(rdram + recvBuf, &reply, sizeof(reply));
                 const uint32_t cachedSize = s_lastOpenedFileSize.load(std::memory_order_relaxed);
                 uint32_t readDestPtr = 0u;
@@ -2171,12 +2234,17 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 {
                     std::memcpy(rdram + readDestPtr, &cachedSize, sizeof(cachedSize));
                 }
+                uint32_t field0x10 = 0u, field0x14 = 0u;
+                std::memcpy(&field0x10, rdram + kReadSendBuf + 0x10u, sizeof(field0x10));
+                std::memcpy(&field0x14, rdram + kReadSendBuf + 0x14u, sizeof(field0x14));
                 static std::atomic<uint32_t> s_loggedReadReply{0u};
                 if (s_loggedReadReply.fetch_add(1u, std::memory_order_relaxed) < 100u)
                 {
                     std::cerr << "[sifcall-read-reply] semToSignal=" << semToSignal
                               << " readDestPtr=0x" << std::hex << readDestPtr << std::dec
-                              << " cachedSize=" << cachedSize << std::endl;
+                              << " cachedSize=" << cachedSize
+                              << " field0x10=0x" << std::hex << field0x10
+                              << " field0x14=0x" << field0x14 << std::dec << std::endl;
                 }
                 if (semToSignal != 0u && m_eeScheduler)
                 {
