@@ -1801,6 +1801,22 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
+    // TEMPORARY DIAGNOSTIC (2026-08-27): which of the 4 known call sites
+    // (0x100354, 0x1085bc, 0x162174, 0x1647e0) actually invokes FUN_0011bba8
+    // (the open routine) during boot, and with what a0 (file-slot index
+    // passed through to func_11B100's table lookup)?
+    if (targetPc == 0x11bba8u)
+    {
+        static std::atomic<uint32_t> s_loggedOpenCallSite{0u};
+        if (s_loggedOpenCallSite.fetch_add(1u, std::memory_order_relaxed) < 100u)
+        {
+            std::cerr << "[fun-open-callsite] source=0x" << std::hex << sourcePc
+                      << " a0(reg4)=0x" << getRegU32(ctx, 4)
+                      << " a1(reg5)=0x" << getRegU32(ctx, 5)
+                      << std::dec << std::endl;
+        }
+    }
+
     // TEMPORARY DIAGNOSTIC (2026-08-27): does 0x3D8768 (the seed target for
     // func_11B8B0's first comparison) actually still hold "3000" at the
     // moment of the check? Verifying directly since the seed fix didn't
@@ -1940,6 +1956,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         {
             const uint32_t bufPtr = getRegU32(ctx, 16) & 0x1FFFFFFFu;
             uint32_t rpcNumber = 0u, sendSize = 0u, recvBuf = 0u, recvSize = 0u;
+            // Cache of the last successfully-opened file's real size (see
+            // project memory, 2026-08-27), set by the open-reply branch and
+            // consumed by the read-reply branch below. Deliberately simple:
+            // scoped narrowly to this single client/recv_buf chain, where
+            // open is always immediately followed by its own read(s) with no
+            // interleaving of a different file -- confirmed via live testing
+            // this session. Not a general per-file-descriptor cache.
+            static std::atomic<uint32_t> s_lastOpenedFileSize{0u};
             if (bufPtr <= PS2_RAM_SIZE - 0x30u)
             {
                 std::memcpy(&rpcNumber, rdram + bufPtr + 0x20u, sizeof(rpcNumber));
@@ -2062,6 +2086,35 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 }
                 const int32_t reply = found ? static_cast<int32_t>(size) : -1;
                 std::memcpy(rdram + recvBuf, &reply, sizeof(reply));
+                // FIX (see project memory, 2026-08-27): FUN_0011bba8 later
+                // does WRITE32(allocatedSlot+0, READ32(destPtr)) where
+                // destPtr is a caller-local stack address it embedded in
+                // this SAME send buffer at +0x4 -- a second, out-of-band
+                // result channel distinct from recvBuf, used to seed the
+                // 32-slot file-descriptor table's own +0 field (read
+                // verbatim, unmodified, by the later read call). Without
+                // this, that field stays at its static-init value of 0.
+                // Writing the real LBA here is our best-evidence guess at
+                // its intended content (the only other real per-file value
+                // we have from Ps2DiscFs); verify live before trusting this
+                // further downstream.
+                if (found)
+                {
+                    s_lastOpenedFileSize.store(size, std::memory_order_relaxed);
+                    uint32_t destPtr = 0u;
+                    std::memcpy(&destPtr, rdram + kOpenSendBuf + 0x4u, sizeof(destPtr));
+                    destPtr &= 0x1FFFFFFFu;
+                    if (destPtr != 0u && destPtr <= PS2_RAM_SIZE - 4u)
+                    {
+                        std::memcpy(rdram + destPtr, &lba, sizeof(lba));
+                        static std::atomic<uint32_t> s_loggedOpenLbaWrite{0u};
+                        if (s_loggedOpenLbaWrite.fetch_add(1u, std::memory_order_relaxed) < 100u)
+                        {
+                            std::cerr << "[sifcall-open-lba-write] destPtr=0x" << std::hex << destPtr
+                                      << " lba=" << std::dec << lba << std::endl;
+                        }
+                    }
+                }
                 static std::atomic<uint32_t> s_loggedOpenReply{0u};
                 if (s_loggedOpenReply.fetch_add(1u, std::memory_order_relaxed) < 100u)
                 {
@@ -2075,6 +2128,61 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                     const int signalResult =
                         m_eeScheduler->signalSemaphore(static_cast<int>(semToSignal), false);
                     std::cerr << "[sifcall-open-signal] semId=" << semToSignal
+                              << " signalResult=" << signalResult << std::endl;
+                }
+            }
+            // FIX (see project memory, 2026-08-27): FUN_0011bfb0's read call
+            // reuses the exact same client/recv_buf/send_buf shape as the
+            // open above, but with rpc_number==4 instead of 0 -- confirmed
+            // live via [call-packet-dump] (client=0x3d8740, send_size=0x1c,
+            // recv_size=4, recv_buf=0x3d7c80). Same fix shape: read the
+            // semaphore id this call embeds at the send buffer's +0x0 (same
+            // convention as the open), acknowledge with a non-negative reply
+            // (func_11B010's retry loop, shared by both open and read,
+            // discards the reply's actual value on the success path -- it
+            // only checks the sign bit), and signal completion directly.
+            // CORRECTED (see project memory, 2026-08-27): the bare "0" reply
+            // this branch originally wrote was NOT harmless -- FUN_0011bfb0's
+            // own success return value comes from a SECOND out-of-band
+            // channel (READ32(sp+0x30) at its return, fed by the destPtr
+            // embedded in this SAME send buffer's +0x4 field, the exact same
+            // convention as the open's LBA write), and that value feeds
+            // directly into FUN_00164710's size-rounding/allocation call
+            // (func_100860). Writing 0 there caused a real, confirmed
+            // infinite loop (FUN_0012a670 called 50+ times with byte-for-
+            // byte identical arguments -- proven live, not inferred). Reusing
+            // the just-opened file's real size (cached from the open branch
+            // above) is our best-evidence fix; this still does not copy real
+            // file BYTES into any destination buffer, only reports a
+            // plausible size -- watch for whether that distinction matters
+            // once code that reads the actual content is reached.
+            else if (recvSize == 4u && rpcNumber == 4u && recvBuf == 0x3d7c80u)
+            {
+                constexpr uint32_t kReadSendBuf = 0x3D7040u;
+                uint32_t semToSignal = 0u;
+                std::memcpy(&semToSignal, rdram + kReadSendBuf, sizeof(semToSignal));
+                const int32_t reply = 0;
+                std::memcpy(rdram + recvBuf, &reply, sizeof(reply));
+                const uint32_t cachedSize = s_lastOpenedFileSize.load(std::memory_order_relaxed);
+                uint32_t readDestPtr = 0u;
+                std::memcpy(&readDestPtr, rdram + kReadSendBuf + 0x4u, sizeof(readDestPtr));
+                readDestPtr &= 0x1FFFFFFFu;
+                if (cachedSize != 0u && readDestPtr != 0u && readDestPtr <= PS2_RAM_SIZE - 4u)
+                {
+                    std::memcpy(rdram + readDestPtr, &cachedSize, sizeof(cachedSize));
+                }
+                static std::atomic<uint32_t> s_loggedReadReply{0u};
+                if (s_loggedReadReply.fetch_add(1u, std::memory_order_relaxed) < 100u)
+                {
+                    std::cerr << "[sifcall-read-reply] semToSignal=" << semToSignal
+                              << " readDestPtr=0x" << std::hex << readDestPtr << std::dec
+                              << " cachedSize=" << cachedSize << std::endl;
+                }
+                if (semToSignal != 0u && m_eeScheduler)
+                {
+                    const int signalResult =
+                        m_eeScheduler->signalSemaphore(static_cast<int>(semToSignal), false);
+                    std::cerr << "[sifcall-read-signal] semId=" << semToSignal
                               << " signalResult=" << signalResult << std::endl;
                 }
             }

@@ -370,6 +370,27 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
+    // Temporary watchpoint (2026-08-27): does ANYTHING ever write into the
+    // 32-slot/16-byte-stride file-descriptor table at 0x3D8540-0x3D8740
+    // (confirmed shared between FUN_0011bba8's open, func_11AF88's slot
+    // allocator, and FUN_0011bfb0/func_11B100's read-side lookup)? Slot
+    // field +0 was observed as 0 at read time, producing a nonsensical
+    // block-count computation downstream -- this checks whether ANY guest
+    // code ever populates it (or any other slot field), before assuming a
+    // host-side fix is required.
+    if (guestAddr >= 0x3d8540u && guestAddr < 0x3d8740u)
+    {
+        static std::atomic<uint32_t> s_watchFdTableLogCount{0u};
+        if (s_watchFdTableLogCount.fetch_add(1u, std::memory_order_relaxed) < 200u)
+        {
+            std::cerr << "[watch-fdtable] addr=0x" << std::hex << guestAddr
+                      << " slotOffset=0x" << ((guestAddr - 0x3d8540u) % 0x10u)
+                      << " size=" << std::dec << size
+                      << " valueLo=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << std::dec << std::endl;
+        }
+    }
     // TODO we dont need this anymore so on next release it will be deleted
 }
 
