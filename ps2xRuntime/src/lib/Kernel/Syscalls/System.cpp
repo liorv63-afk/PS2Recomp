@@ -408,9 +408,19 @@ namespace ps2_syscalls
     bool dispatchSyscallOverride(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t handler = 0u;
-        if (!runtime || !ctx ||
-            !runtime->findEeSyscallOverride(syscallNumber, handler) ||
-            handler == 0u)
+        const bool hasOverride = runtime && ctx && runtime->findEeSyscallOverride(syscallNumber, handler);
+        {
+            static std::atomic<uint32_t> s_overrideLogCount{0u};
+            if (s_overrideLogCount.fetch_add(1u, std::memory_order_relaxed) < 32u)
+            {
+                std::cerr << "[syscall-override-check] number=0x" << std::hex << syscallNumber
+                          << " hasOverride=" << hasOverride
+                          << " handler=0x" << handler
+                          << " hasFunction=" << (runtime && handler ? runtime->hasFunction(handler) : false)
+                          << std::dec << std::endl;
+            }
+        }
+        if (!hasOverride || handler == 0u)
         {
             return false;
         }
@@ -716,7 +726,7 @@ namespace ps2_syscalls
                                           const FindAddressMatchSample *matches,
                                           uint32_t matchCount)
     {
-#if !AGRESSIVE_LOGS
+#if 0
         return;
 #else
         static std::atomic<uint32_t> s_findAddressHitLogs{0u};

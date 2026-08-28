@@ -145,6 +145,25 @@ namespace ps2_syscalls
         removeHandler(rdram, ctx, runtime, true);
     }
 
+    void LinkedIntcHandlerBridge(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t cause = getRegU32(ctx, 4);    // a0
+        const uint32_t handler = getRegU32(ctx, 6);  // a2
+        const uint32_t argument = getRegU32(ctx, 7); // a3
+        const uint32_t gp = getRegU32(ctx, 28);
+        const uint32_t sp = getRegU32(ctx, 29);
+
+        const int id = scheduler(rdram, ctx, runtime)
+                           .addIrqHandler(false /*dmac*/, cause, handler, true /*append*/, argument, gp, sp);
+        std::cerr << "[LinkedIntcHandlerBridge] cause=" << std::dec << cause
+                  << " handler=0x" << std::hex << handler
+                  << " argument=0x" << argument
+                  << " hasHandlerFn=" << runtime->hasFunction(handler)
+                  << " id=" << std::dec << id << std::endl;
+        setReturnS32(ctx, id);
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
     void EnableIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setHandlerEnabled(rdram, ctx, runtime, false, true);

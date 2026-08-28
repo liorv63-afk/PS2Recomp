@@ -796,6 +796,7 @@ namespace ps2recomp
             m_reporter.progress("parsing ELF");
             m_elfParser = std::make_unique<ElfParser>(m_config.inputPath);
             m_elfParser->setReporter(&m_reporter);
+            m_elfParser->setSkipJalScanFallback(!m_config.ghidraMapPath.empty());
             if (!m_elfParser->parse())
             {
                 m_reporter.error("elf", "Failed to parse ELF file: " + m_config.inputPath);

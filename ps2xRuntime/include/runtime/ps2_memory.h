@@ -278,6 +278,8 @@ public:
     uint8_t *getIOPRAM() { return iop_ram; }
     uint64_t dmaStartCount() const { return m_dmaStartCount.load(std::memory_order_relaxed); }
     uint64_t gifCopyCount() const { return m_gifCopyCount.load(std::memory_order_relaxed); }
+    bool path3Masked() const { return m_path3Masked; }
+    size_t path3MaskedFifoSize() const { return m_path3MaskedFifo.size(); }
     uint64_t gsWriteCount() const { return m_gsWriteCount.load(std::memory_order_relaxed); }
     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
     uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }

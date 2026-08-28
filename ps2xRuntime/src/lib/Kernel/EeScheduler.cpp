@@ -4,10 +4,15 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace
 {
@@ -224,13 +229,195 @@ void EeScheduler::run()
             --m_debugPublishCountdown;
         }
 
+        // DIAGNOSTIC (see project memory, 2026-08-25): log every DISTINCT pc
+        // value visited by the recycled-id "1" thread (the one stuck deep in
+        // FUN_00160b00's boot cascade), bypassing all call/return-tracing
+        // ambiguity -- ground truth regardless of jal/jr $ra visibility.
+        if (m_currentThreadId == 1)
+        {
+            // DIAGNOSTIC (see project memory, 2026-08-26): a 45-minute
+            // unattended run showed thread 1 parked at pc=0x165e9c (inside
+            // FUN_00165c00, a script/opcode-dispatcher-shaped function)
+            // identically at two checks 20 minutes apart, with gifCopyCount
+            // never changing -- strong evidence of a genuine stall, not a
+            // healthy repeating per-vblank callback. Directly count how
+            // many times FUN_00165c00 is FRESHLY entered (pc==0x165c00,
+            // its own start) vs how many times it's RESUMED at 0x165e9c
+            // specifically, throttled to 1/sec, to determine whether this
+            // is one single invocation stuck forever (fresh-entry count
+            // stays at/near 1) or a healthy per-vblank callback that
+            // happens to often be sampled mid-lap (fresh-entry count keeps
+            // climbing roughly in step with vsyncTick).
+            if (context.pc == 0x165c00u || context.pc == 0x165e9cu)
+            {
+                static uint64_t s_freshEntryCount = 0u;
+                static uint64_t s_resumeAt165e9cCount = 0u;
+                static int64_t s_lastLogMs165c00 = 0;
+                if (context.pc == 0x165c00u) { ++s_freshEntryCount; }
+                else { ++s_resumeAt165e9cCount; }
+                const auto nowMs165c00 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count();
+                if (nowMs165c00 - s_lastLogMs165c00 >= 1000)
+                {
+                    s_lastLogMs165c00 = nowMs165c00;
+                    std::cerr << "[165c00-tracker] freshEntries=" << s_freshEntryCount
+                              << " resumesAt165e9c=" << s_resumeAt165e9cCount
+                              << " vsyncTick=" << m_vsyncTick << std::endl;
+                }
+            }
+            // DIAGNOSTIC (see project memory, 2026-08-26): FUN_00165c00 is
+            // very likely an entity/command-queue processor (confirmed
+            // func_12C560 is a table[entityId][slot] lookup returning 0x63
+            // as an "empty slot" sentinel). Log the actual dispatch value
+            // ($v1, read from [s4]=[s2+0x14] at 0x165c74, right after the
+            // load at 0x165c70) each time, throttled, to see what state
+            // this entity-processor is actually cycling through -- e.g.
+            // constantly 0x63 would mean "nothing to do yet", a real token
+            // value repeating would identify which handler is looping.
+            if (context.pc == 0x165c74u)
+            {
+                static uint64_t s_dispatchLogCount = 0u;
+                static int64_t s_lastDispatchLogMs = 0;
+                ++s_dispatchLogCount;
+                const auto nowMsDispatch = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::steady_clock::now().time_since_epoch())
+                                               .count();
+                if (nowMsDispatch - s_lastDispatchLogMs >= 1000)
+                {
+                    s_lastDispatchLogMs = nowMsDispatch;
+                    std::cerr << "[165c00-dispatch] iter=" << s_dispatchLogCount
+                              << " v1(state)=0x" << std::hex << getRegU32(&context, 3)
+                              << " s0(param)=0x" << getRegU32(&context, 16)
+                              << " s1(param)=0x" << getRegU32(&context, 17)
+                              << " s2(entity)=0x" << getRegU32(&context, 18)
+                              << std::dec << std::endl;
+                }
+            }
+            // DIAGNOSTIC (see project memory, 2026-08-25): after the two
+            // fixes this session, thread 1 is now cycling through a WIDE
+            // set of addresses (0x108xxx-0x165xxx) rather than a tight
+            // 2-6-instruction spin -- ambiguous from periodic sampling
+            // alone whether this is a genuine healthy repeating loop or
+            // still slow forward progress. Track the SET of all distinct
+            // addresses ever visited and log only genuinely NEW ones (no
+            // cap) -- this scales with unique code reached, not with how
+            // many times any loop repeats, so a stable log (no new entries
+            // for a long time) means it settled into a fixed repeating
+            // loop, while continued new entries mean real progress.
+            static std::unordered_set<uint32_t> s_seenPcs;
+            static uint32_t s_newPcCount = 0u;
+            if (s_seenPcs.insert(context.pc).second)
+            {
+                std::cerr << "[thread1-new-pc] #" << s_newPcCount << " pc=0x" << std::hex << context.pc
+                          << std::dec << " eeCycle=" << m_eeCycle << std::endl;
+                ++s_newPcCount;
+            }
+
+            static uint32_t s_lastLoggedPc = 0xFFFFFFFFu;
+            static uint32_t s_pcTraceCount = 0u;
+            const bool inNoisyScanLoop = (context.pc == 0x120a18u || context.pc == 0x120a1cu || context.pc == 0x120a24u);
+            // NARROWED (see project memory, 2026-08-26): 0x131000-0x133000
+            // is already-understood, previously-traced territory (the long
+            // linear stretch the old 5000-cap trace exhausted itself on) --
+            // skip logging it entirely so the cap is spent on the NEW
+            // territory reached after the 0x250ca4 function-table fix
+            // (0x12bcXX, 0x160abc/FUN_001609c0, and whatever comes after).
+            const bool inAlreadyUnderstoodRange = (context.pc >= 0x131000u && context.pc < 0x133000u);
+            if (s_lastLoggedPc != context.pc && s_pcTraceCount < 20000u && !inNoisyScanLoop && !inAlreadyUnderstoodRange)
+            {
+                s_lastLoggedPc = context.pc;
+                std::cerr << "[thread1-pc-trace] #" << s_pcTraceCount << " pc=0x" << std::hex << context.pc
+                          << std::dec << " eeCycle=" << m_eeCycle << std::endl;
+                ++s_pcTraceCount;
+            }
+            // DIAGNOSTIC (see project memory, 2026-08-26): the new busy-wait
+            // delay loop at 0x12bca8-0x12bcbc (decrement v0, loop while
+            // v0!=v1) reached after the 0x250ca4 fix -- capture v0/v1 and an
+            // iteration count periodically to see whether it's genuinely
+            // converging (v0 approaching v1) and estimate whether it will
+            // realistically complete, versus spinning on a stuck/corrupted
+            // value.
+            if (context.pc == 0x12bcbcu)
+            {
+                static uint64_t s_delayLoopIterCount = 0u;
+                static int64_t s_lastDelayLogMs = 0;
+                const auto nowMsDelay = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count();
+                ++s_delayLoopIterCount;
+                if (nowMsDelay - s_lastDelayLogMs >= 1000)
+                {
+                    s_lastDelayLogMs = nowMsDelay;
+                    std::cerr << "[delay-12bcbc] iter=" << s_delayLoopIterCount
+                              << " v0=0x" << std::hex << getRegU32(&context, 2)
+                              << " v1=0x" << getRegU32(&context, 3)
+                              << std::dec << " eeCycle=" << m_eeCycle << std::endl;
+                }
+            }
+            if (context.pc == 0x120a18u)
+            {
+                static uint64_t s_scanIterCount = 0u;
+                static int64_t s_lastLogMs = 0;
+                const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count();
+                ++s_scanIterCount;
+                if (nowMs - s_lastLogMs >= 1000)
+                {
+                    s_lastLogMs = nowMs;
+                    std::cerr << "[scan-120a18] iter=" << s_scanIterCount
+                              << " a0=0x" << std::hex << getRegU32(&context, 4)
+                              << " a1=0x" << getRegU32(&context, 5)
+                              << " a2=0x" << getRegU32(&context, 6)
+                              << std::dec << std::endl;
+                }
+            }
+        }
+
         m_runtime.m_debugPc.store(context.pc, std::memory_order_relaxed);
         m_runtime.m_debugRa.store(getRegU32(&context, 31), std::memory_order_relaxed);
         m_runtime.m_debugSp.store(getRegU32(&context, 29), std::memory_order_relaxed);
         m_runtime.m_debugGp.store(getRegU32(&context, 28), std::memory_order_relaxed);
 
+        static uint32_t s_thread1LastRealPc = 0xFFFFFFFFu;
+        // DIAGNOSTIC (2026-08-28): a single "last real pc" isn't enough to
+        // see the actual final call/return CHAIN leading up to thread 1
+        // going dormant -- keep a small ring buffer of the last N top-level
+        // re-dispatch points (every value context.pc takes between guest
+        // function returns), dumped at natural-exit, to see whether thread 1
+        // is unwinding through a NORMAL return chain (each frame legitimately
+        // finishing) or hitting an early-return that skips a "broadcast:
+        // real work is ready now" step some other subsystem might depend on.
+        static std::array<uint32_t, 40> s_thread1PcHistory{};
+        static uint32_t s_thread1PcHistoryIndex = 0u;
+        if (m_currentThreadId == 1 && context.pc != 0u)
+        {
+            s_thread1LastRealPc = context.pc;
+            s_thread1PcHistory[s_thread1PcHistoryIndex % s_thread1PcHistory.size()] = context.pc;
+            ++s_thread1PcHistoryIndex;
+        }
+
         if (context.pc == 0u)
         {
+            if (m_currentThreadId == 1 && running->invocations.empty())
+            {
+                static std::atomic<uint32_t> s_loggedThread1Exit{0u};
+                if (s_loggedThread1Exit.fetch_add(1u, std::memory_order_relaxed) < 5u)
+                {
+                    std::cerr << "[thread1-natural-exit] lastRealPc=0x" << std::hex << s_thread1LastRealPc
+                              << std::dec << " eeCycle=" << m_eeCycle << std::endl;
+                    const uint32_t histCount = static_cast<uint32_t>(s_thread1PcHistory.size());
+                    const uint32_t nextIdx = s_thread1PcHistoryIndex % histCount;
+                    std::cerr << "[thread1-exit-pchistory] last " << histCount
+                              << " top-level re-dispatch points (oldest first):" << std::endl;
+                    for (uint32_t i = 0; i < histCount; ++i)
+                    {
+                        std::cerr << "  #" << i << " pc=0x" << std::hex << s_thread1PcHistory[(nextIdx + i) % histCount]
+                                  << std::dec << std::endl;
+                    }
+                }
+            }
             if (!running->invocations.empty())
             {
                 GuestInvocation completed = std::move(running->invocations.back());
@@ -272,6 +459,12 @@ void EeScheduler::run()
             }
             else
             {
+                if (m_currentThreadId == 1)
+                {
+                    std::cerr << "[thread1-crash-dormant] jumped to unmapped pc=0x" << std::hex << context.pc
+                              << " lastRealPc=0x" << s_thread1LastRealPc << std::dec
+                              << " eeCycle=" << m_eeCycle << std::endl;
+                }
                 m_runtime.reportMissingFunction(m_rdram,
                                                 &context,
                                                 context.pc,
@@ -285,9 +478,147 @@ void EeScheduler::run()
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
 
+        // BUG FIX (see project memory, 2026-08-25): checkpointDue() can
+        // return true here -- BEFORE `function` has been invoked even once
+        // this iteration -- specifically when a higher-or-equal-priority
+        // thread is ready (the branch that sets m_rescheduleRequested /
+        // m_timeSliceExpired). Previously this just `continue`d without
+        // resetting m_currentThreadId or requeuing `running`, so line 171's
+        // `if (m_currentThreadId == 0)` stayed false forever and
+        // selectReady() was never called again -- the running thread got
+        // permanently stuck spinning this checkpoint check (still advancing
+        // m_eeCycle via accountCycles(), which is why this looked like
+        // healthy progress from the outside) without ever executing another
+        // instruction, and without the higher-priority thread ever actually
+        // getting to run either. Mirror the correctly-working post-execution
+        // reschedule path (below, ~line 420) so this call site parks the
+        // preempted thread and clears m_currentThreadId the same way. Gated
+        // on m_rescheduleRequested specifically so the *other*
+        // checkpointDue() branches (pending checkpoint, deadline reached --
+        // neither sets this flag) keep their original "process events, then
+        // resume the same thread" behavior unchanged.
         if (checkpointDue(kGuestDispatchCycles))
         {
+            static std::atomic<uint32_t> s_loggedTopCheckpoint{0u};
+            if (s_loggedTopCheckpoint.fetch_add(1u, std::memory_order_relaxed) < 20u)
+            {
+                std::cerr << "[top-checkpoint-hit] threadId=" << m_currentThreadId
+                          << " pc=0x" << std::hex << context.pc << std::dec
+                          << " reschedReq=" << m_rescheduleRequested
+                          << " sliceExpired=" << m_timeSliceExpired
+                          << " checkpointPending=" << m_checkpointPending.load()
+                          << std::endl;
+            }
+            if (m_rescheduleRequested && m_currentThreadId != 0)
+            {
+                enqueueReady(*running, !m_timeSliceExpired);
+                m_currentThreadId = 0;
+                m_rescheduleRequested = false;
+                m_timeSliceExpired = false;
+            }
             continue;
+        }
+
+        {
+            static std::atomic<int64_t> s_schedHeartbeatMs{0};
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+            int64_t last = s_schedHeartbeatMs.load(std::memory_order_relaxed);
+            if (nowMs - last >= 500 &&
+                s_schedHeartbeatMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed))
+            {
+                std::cerr << "[sched-heartbeat] t=" << nowMs
+                          << " pc=0x" << std::hex << context.pc << std::dec
+                          << " threadId=" << m_currentThreadId
+                          << " invocationDepth=" << running->invocations.size()
+                          << " topKind=" << (running->invocations.empty() ? -1 : static_cast<int>(running->invocations.back().kind))
+                          << " eeCycle=" << m_eeCycle
+                          << std::endl;
+                for (const auto &[id, t] : m_threads)
+                {
+                    if (id < 0)
+                    {
+                        continue;
+                    }
+                    std::cerr << "[sched-heartbeat-thread] id=" << id
+                              << " status=" << static_cast<int>(t.status)
+                              << " pc=0x" << std::hex << t.context.pc << std::dec
+                              << " waitReason=" << static_cast<int>(t.wait.reason)
+                              << " invocationDepth=" << t.invocations.size()
+                              << " priority=" << t.currentPriority
+                              << std::endl;
+                }
+                // DIAGNOSTIC (see project memory, 2026-08-25): re-check
+                // whether DQ8 has by now registered a VBlank INTC handler
+                // (cause 2/3) -- the one-shot [handler-dump] fires far too
+                // early (gated on reaching 0x12ae98) to see handlers
+                // registered by later boot code, e.g. once the 7-thread
+                // steady state is reached. Also logs m_vsyncTick to confirm
+                // the existing VBlank dispatch mechanism is actually ticking.
+                std::cerr << "[periodic-handler-dump] vsyncTick=" << m_vsyncTick << std::endl;
+                debugDumpIrqHandlers();
+                // DIAGNOSTIC (see project memory, 2026-08-25): has DQ8 ever
+                // submitted a real GIF/drawing packet? SetGsCrt (display
+                // mode) was confirmed called correctly, but the screen is
+                // still fully black -- checking whether this is because no
+                // draw data has been submitted at all, vs. a rendering bug.
+                std::cerr << "[gif-packet-count] nativePackedGIFPacketCount="
+                          << m_runtime.gs().nativePackedGIFPacketCount()
+                          << " gifCopyCount=" << m_runtime.memory().gifCopyCount()
+                          << " path3Masked=" << m_runtime.memory().path3Masked()
+                          << " path3MaskedFifoSize=" << m_runtime.memory().path3MaskedFifoSize()
+                          << std::endl;
+                {
+                    GSRegisters &gsRegs = m_runtime.memory().gs();
+                    const GSDebugSnapshot gsSnap = m_runtime.gs().getDebugSnapshot();
+                    std::cerr << "[gs-state] pmode=0x" << std::hex << gsRegs.pmode
+                              << " dispfb1=0x" << gsRegs.dispfb1
+                              << " display1=0x" << gsRegs.display1
+                              << " csr=0x" << gsRegs.csr.load() << std::dec
+                              << " hasHostFrame=" << gsSnap.hasHostPresentationFrame
+                              << " hostW=" << gsSnap.hostPresentationWidth
+                              << " hostH=" << gsSnap.hostPresentationHeight
+                              << std::endl;
+                }
+                // DIAGNOSTIC (see project memory, 2026-08-25): zero GIF
+                // packets processed and a still-black (but correctly
+                // configured) framebuffer -- check whether a VIF1/GIF DMA
+                // transfer was ever started but never completed (same bug
+                // class as the SIF DMA-completion issue fixed earlier this
+                // session), which would explain why no draw data ever
+                // reaches the GS frontend.
+                {
+                    PS2Memory &memIo = m_runtime.memory();
+                    std::cerr << "[dma-state]"
+                              << " D_STAT=0x" << std::hex << memIo.readIORegister(0x1000e010u)
+                              << " VIF1_CHCR=0x" << memIo.readIORegister(0x10009000u)
+                              << " VIF1_MADR=0x" << memIo.readIORegister(0x10009010u)
+                              << " VIF1_QWC=0x" << memIo.readIORegister(0x10009020u)
+                              << " GIF_CHCR=0x" << memIo.readIORegister(0x1000a000u)
+                              << " GIF_MADR=0x" << memIo.readIORegister(0x1000a010u)
+                              << " GIF_QWC=0x" << memIo.readIORegister(0x1000a020u)
+                              << std::dec << std::endl;
+                }
+                // DIAGNOSTIC (see project memory, 2026-08-25): full
+                // semaphore table dump, same data source the built-in
+                // ImGui debug panel's Kernel tab uses (runtime.snapshot()).
+                // Far more efficient than guessing individual semaphore
+                // ids one at a time -- shows every semaphore with waiters
+                // queued in one pass.
+                const EeKernelSnapshot fullSnap = snapshot();
+                for (const EeSemaphoreSnapshot &sema : fullSnap.semaphores)
+                {
+                    if (sema.waiters > 0)
+                    {
+                        std::cerr << "[sema-with-waiters] id=" << sema.id
+                                  << " count=" << sema.count
+                                  << " maxCount=" << sema.maxCount
+                                  << " waiters=" << sema.waiters
+                                  << std::endl;
+                    }
+                }
+            }
         }
 
         try
@@ -420,7 +751,15 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    // Relaxed from `< 1` to `< 0`: DQ8 (a commercial retail title built
+    // against Sony's official, proprietary SDK) creates a thread with
+    // initial_priority=0. The homebrew ps2sdk convention documents
+    // HIGHEST_PRIORITY as 1, but there is no public source confirming the
+    // real EE BIOS kernel enforces that as a hard minimum for retail-SDK
+    // binaries -- see project memory, 2026-08-25, for the full trace
+    // (func_1175F8's CreateThread call, rejected here, was the reason only
+    // one EE thread ever existed at the pool-initializer stall).
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -1266,6 +1605,17 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
             m_runtime.hasFunction(handler.handler))
         {
             matching.push_back(handler);
+            if (handler.handler == 0x121790u)
+            {
+                static std::atomic<uint64_t> s_h121790IrqCount{0u};
+                const uint64_t n = s_h121790IrqCount.fetch_add(1u, std::memory_order_relaxed);
+                if (n < 20u)
+                {
+                    std::cerr << "[dispatchIrq->0x121790] #" << std::dec << n
+                              << " dmac=" << dmac << " cause=" << cause
+                              << " eeCycle=" << m_eeCycle << std::endl;
+                }
+            }
         }
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
@@ -1477,6 +1827,26 @@ EeKernelSnapshot EeScheduler::snapshot() const
 {
     std::lock_guard lock(m_snapshotMutex);
     return m_snapshot;
+}
+
+void EeScheduler::debugDumpIrqHandlers() const
+{
+    std::cerr << "[handler-dump] intcCount=" << m_intcHandlers.size()
+              << " dmacCount=" << m_dmacHandlers.size() << std::endl;
+    for (const auto &[id, h] : m_intcHandlers)
+    {
+        std::cerr << "[handler-dump] intc id=" << id
+                  << " cause=" << h.cause
+                  << " handler=0x" << std::hex << h.handler << std::dec
+                  << " enabled=" << h.enabled << std::endl;
+    }
+    for (const auto &[id, h] : m_dmacHandlers)
+    {
+        std::cerr << "[handler-dump] dmac id=" << id
+                  << " cause=" << h.cause
+                  << " handler=0x" << std::hex << h.handler << std::dec
+                  << " enabled=" << h.enabled << std::endl;
+    }
 }
 
 void EeScheduler::publishSnapshot()

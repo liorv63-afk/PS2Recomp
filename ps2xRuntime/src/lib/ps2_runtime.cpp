@@ -1338,6 +1338,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
     uint32_t sif12bcd4ClientPtr = 0u;
+    // See the func_11C1F0 data-delivery fix below (2026-08-28) and its
+    // corresponding post-call application further down, right after
+    // targetFn(rdram, ctx, this) -- v0 must be overridden AFTER the guest
+    // function actually runs, not before, or it gets overwritten.
+    uint32_t pendingC1f0DeliveredSize = 0u;
 
     // DIAGNOSTIC (see project memory, 2026-08-26): find the actual
     // indirect-jump/call instruction responsible for thread 1's crash into
@@ -1694,6 +1699,97 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
+    // DIAGNOSTIC (2026-08-28): find the REAL caller of func_11A768 for the
+    // client=0x3dd8c0 call (the one looping with a fresh semaphore id every
+    // attempt) -- $ra captured at the WaitSema syscall site inside
+    // func_11A768 only reflects func_11A768's OWN internal JAL to
+    // func_119B68, not its actual caller. Capturing $ra/a1/a2/a3 at
+    // func_11A768's own entry (a0 == client pointer) gives the real caller.
+    if (targetPc == 0x11a768u && getRegU32(ctx, 4) == 0x3dd8c0u)
+    {
+        static std::atomic<uint32_t> s_loggedCaller3dd8c0{0u};
+        if (s_loggedCaller3dd8c0.fetch_add(1u, std::memory_order_relaxed) < 10u)
+        {
+            std::cerr << "[caller-11a768-3dd8c0] ra=0x" << std::hex << getRegU32(ctx, 31)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << " a3=0x" << getRegU32(ctx, 7)
+                      << std::dec << std::endl;
+        }
+    }
+
+    // DIAGNOSTIC (2026-08-28): find the REAL caller of FUN_00165c00 (the
+    // token dispatcher DQ8's own boot script/event content is supposed to
+    // flow through -- confirmed live via [165c00-dispatch2] that it's
+    // reached with NULL a0(entity)/a1(cursor) at most once in a 5-minute
+    // run, not processing real content). A literal-address grep across the
+    // generated tree found no static caller (likely $gp-relative or
+    // register-computed addressing) -- capturing $ra/a0/a1/a2 at this
+    // function's own entry point finds the real caller directly, live,
+    // the same technique already used successfully today for
+    // func_11A768/func_11C1F0.
+    if (targetPc == 0x165c00u)
+    {
+        static std::atomic<uint32_t> s_loggedCaller165c00{0u};
+        if (s_loggedCaller165c00.fetch_add(1u, std::memory_order_relaxed) < 30u)
+        {
+            std::cerr << "[caller-165c00] ra=0x" << std::hex << getRegU32(ctx, 31)
+                      << " a0(entity)=0x" << getRegU32(ctx, 4)
+                      << " a1(cursor)=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << std::dec << std::endl;
+        }
+    }
+    // DIAGNOSTIC (2026-08-28): one level further up -- who calls
+    // FUN_00165570 (the function that reads entity+0xB4/+0xB8 and passes
+    // them to the dispatcher)? This is the context that would decide WHEN
+    // real work should be pushed, if it ever is.
+    // DIAGNOSTIC (2026-08-28): find the caller of FUN_0024f3f0 (creates
+    // thread 9, a generic "process queued work" worker whose real role
+    // depends entirely on the struct passed at creation) to identify what
+    // subsystem this thread actually belongs to.
+    // DIAGNOSTIC (2026-08-28): find the caller of FUN_0024dc60 (creates
+    // thread 9's queue and spawns it) -- looking for the same shape as
+    // func_1690E0's now-confirmed "checks a condition that never becomes
+    // true, but no longer actually blocks" pattern.
+    if (targetPc == 0x24dc60u)
+    {
+        static std::atomic<uint32_t> s_loggedCaller24dc60{0u};
+        if (s_loggedCaller24dc60.fetch_add(1u, std::memory_order_relaxed) < 30u)
+        {
+            std::cerr << "[caller-24dc60] ra=0x" << std::hex << getRegU32(ctx, 31)
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << std::dec << std::endl;
+        }
+    }
+    if (targetPc == 0x24f3f0u)
+    {
+        static std::atomic<uint32_t> s_loggedCaller24f3f0{0u};
+        if (s_loggedCaller24f3f0.fetch_add(1u, std::memory_order_relaxed) < 30u)
+        {
+            std::cerr << "[caller-24f3f0] ra=0x" << std::hex << getRegU32(ctx, 31)
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x165570u)
+    {
+        static std::atomic<uint32_t> s_loggedCaller165570{0u};
+        if (s_loggedCaller165570.fetch_add(1u, std::memory_order_relaxed) < 30u)
+        {
+            std::cerr << "[caller-165570] ra=0x" << std::hex << getRegU32(ctx, 31)
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << " a1=0x" << getRegU32(ctx, 5)
+                      << " a2=0x" << getRegU32(ctx, 6)
+                      << std::dec << std::endl;
+        }
+    }
+
     if (targetPc == 0x116860u && sourcePc == 0x11a664u)
     {
         static std::atomic<uint32_t> s_loggedWaitAt11a664{0u};
@@ -1829,7 +1925,19 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // exact point the guest registers the buffer, copy the real disc bytes
     // for the just-opened file (cached lba/size from the open-reply fix)
     // straight into it via Ps2DiscFs.
-    if (targetPc == 0x11c1f0u && sourcePc == 0x164904u && rdram)
+    // WIDENED (2026-08-28): FUN_00100330 (the low-level "open+read+close one
+    // file" boot loader, e.g. for TITLE.BIN) calls func_11C1F0 from its own
+    // call site (0x1003b4) with the identical (destBuf=a1, destSize=a2)
+    // signature -- confirmed live it always returned v0=0 (no data ever
+    // delivered) since this call site wasn't covered, which meant
+    // FUN_00100330's own `bgtzl s1` check after this call always failed,
+    // skipping its "finish successfully" tail (label_1003d4 onward, which
+    // sets the function's true success return value) -- so it always
+    // returned "failure" even though the underlying open/size-query both
+    // genuinely succeeded (confirmed via [fn100330-firstread-return]
+    // correctly reporting TITLE.BIN's real 20864-byte size). Same fix,
+    // same fields, just recognizing this second, equally legitimate caller.
+    if (targetPc == 0x11c1f0u && (sourcePc == 0x164904u || sourcePc == 0x1003b4u) && rdram)
     {
         const uint32_t destBuf = getRegU32(ctx, 5) & 0x1FFFFFFFu;
         const uint32_t destSize = getRegU32(ctx, 6);
@@ -1846,6 +1954,20 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             if (bytes.size() == destSize)
             {
                 std::memcpy(rdram + destBuf, bytes.data(), destSize);
+                // FIX (2026-08-28): setting v0 HERE (before targetFn runs)
+                // doesn't stick -- func_11C1F0's own guest code executes
+                // AFTER this hook (see targetFn(rdram, ctx, this) below) and
+                // recomputes v0=0 itself regardless of caller, overwriting
+                // whatever we set. Confirmed live via
+                // [fn100330-11c1f0-return] staying 0x0 even after this hook
+                // started correctly copying the real bytes (the memcpy is a
+                // side effect on rdram, unaffected by the guest code running
+                // afterward, but ctx's registers are not). Deferred the
+                // actual v0 override to AFTER targetFn() returns (see
+                // pendingC1f0DeliveredSize below), matching the established
+                // pattern already used for func_11A588's server-pointer fix
+                // (2026-08-26, same file, "applied AFTER ... returns").
+                pendingC1f0DeliveredSize = destSize;
             }
             if (s_loggedDataDeliveryCount.fetch_add(1u, std::memory_order_relaxed) < 100u)
             {
@@ -1869,11 +1991,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     if (targetPc == 0x11bba8u)
     {
         static std::atomic<uint32_t> s_loggedOpenCallSite{0u};
-        if (s_loggedOpenCallSite.fetch_add(1u, std::memory_order_relaxed) < 100u)
+        // CAP RAISED (2026-08-28): needed to see calls late into a long run
+        // (TITLE.BIN re-open loop, thousands of prior opens already logged).
+        if (s_loggedOpenCallSite.fetch_add(1u, std::memory_order_relaxed) < 20000u)
         {
             std::cerr << "[fun-open-callsite] source=0x" << std::hex << sourcePc
                       << " a0(reg4)=0x" << getRegU32(ctx, 4)
                       << " a1(reg5)=0x" << getRegU32(ctx, 5)
+                      << " ra=0x" << getRegU32(ctx, 31)
                       << std::dec << std::endl;
         }
     }
@@ -1965,6 +2090,27 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
+    if (targetPc == 0x116860u && sourcePc == 0x1660ccu)
+    {
+        // DIAGNOSTIC (2026-08-28): FUN_00166080 (called every tick from the
+        // main per-frame dispatcher FUN_001690e0 via func_166160/entity-cursor
+        // fields 0x3f1864/0x3f1868 at offsets +0xB4/+0xB8) used to bail out
+        // early when those cursor fields held the -1 sentinel; a fresh capture
+        // now shows them holding 0/0 instead, letting execution fall through
+        // to this WaitSema call for the first time. Logging semId to find out
+        // whether it's ever signaled (a real render-path unblock) or whether
+        // this is where the newly-unblocked path now gets stuck instead.
+        static std::atomic<uint32_t> s_loggedWaitAt1660d4{0u};
+        const uint32_t n1660d4 = s_loggedWaitAt1660d4.fetch_add(1u, std::memory_order_relaxed);
+        if (n1660d4 < 500u)
+        {
+            std::cerr << "[wait-1660d4] #" << std::dec << n1660d4
+                      << " semId=0x" << std::hex << getRegU32(ctx, 4)
+                      << " threadId=" << std::dec << m_eeScheduler->currentThreadId()
+                      << std::endl;
+        }
+    }
+
     if (targetPc == 0x116860u && sourcePc == 0x11a924u)
     {
         static std::atomic<uint32_t> s_loggedWaitAt11a924{0u};
@@ -2016,13 +2162,17 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (rdram)
         {
             const uint32_t bufPtr = getRegU32(ctx, 16) & 0x1FFFFFFFu;
-            uint32_t rpcNumber = 0u, sendSize = 0u, recvBuf = 0u, recvSize = 0u;
+            uint32_t rpcNumber = 0u, sendSize = 0u, recvBuf = 0u, recvSize = 0u, client = 0u;
             if (bufPtr <= PS2_RAM_SIZE - 0x30u)
             {
+                // client lives at word 7 (offset 0x1c), per [call-packet-dump]'s
+                // established word mapping (2026-08-27).
+                std::memcpy(&client, rdram + bufPtr + 0x1cu, sizeof(client));
                 std::memcpy(&rpcNumber, rdram + bufPtr + 0x20u, sizeof(rpcNumber));
                 std::memcpy(&sendSize, rdram + bufPtr + 0x24u, sizeof(sendSize));
                 std::memcpy(&recvBuf, rdram + bufPtr + 0x28u, sizeof(recvBuf));
                 std::memcpy(&recvSize, rdram + bufPtr + 0x2cu, sizeof(recvSize));
+                client &= 0x1FFFFFFFu;
                 recvBuf &= 0x1FFFFFFFu;
             }
             // TEMPORARY DIAGNOSTIC (2026-08-27): unconditional, uncapped
@@ -2035,6 +2185,26 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 std::cerr << "[wait-11a924-3dd980] bufPtr=0x" << std::hex << bufPtr
                           << " sendSize=0x" << sendSize << " recvSize=0x" << recvSize
                           << std::dec << std::endl;
+            }
+            // DIAGNOSTIC (2026-08-27, later session): recv_buf=0x3dd880
+            // (client 0x3dd8c0) is looping with a fresh semaphore id every
+            // call (confirmed via [wait-11a924] hitting its log cap with
+            // monotonically increasing semId) -- recv_size==1 doesn't match
+            // any existing fixed branch, so recv_buf is never populated and
+            // the caller presumably re-issues the call forever. Capturing
+            // $ra here to identify the actual calling function before
+            // guessing at a reply format.
+            if (recvBuf == 0x3dd880u)
+            {
+                static std::atomic<uint32_t> s_loggedNewClientCall{0u};
+                if (s_loggedNewClientCall.fetch_add(1u, std::memory_order_relaxed) < 20u)
+                {
+                    std::cerr << "[wait-11a924-3dd880] bufPtr=0x" << std::hex << bufPtr
+                              << " rpcNumber=0x" << rpcNumber
+                              << " sendSize=0x" << sendSize << " recvSize=0x" << recvSize
+                              << " ra=0x" << getRegU32(ctx, 31)
+                              << std::dec << std::endl;
+                }
             }
             // FIX (see project memory, 2026-08-27): rpc_number==0xff is a
             // DIFFERENT call shape from the rpc_number==0 streaming-read
@@ -2101,11 +2271,57 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             // earlier in FUN_0011bba8). Narrowly gated on rpc_number==0 and
             // this exact recv_buf to avoid misfiring on other, uncharacted
             // recv_size==4 call shapes that might exist elsewhere.
-            else if (recvSize == 4u && rpcNumber == 0u && recvBuf == 0x3d7c80u)
+            // NOTE (2026-08-28): `sendSize==0x418`/`client==0x3d8740` were
+            // added as extra gates hoping to exclude a bad call, but did
+            // NOT fix it -- `client` here is read from `bufPtr+0x1c` (the
+            // pool-allocated SIF packet func_11A768 itself builds), which is
+            // DIFFERENT from `kOpenSendBuf` (0x3d7040, FUN_0011bba8's OWN
+            // fixed scratch buffer, 0x40 bytes away) where the earlier hex
+            // dump's suspicious 0x394240/"@p=" bytes actually came from --
+            // two different buffers, wrongly conflated in an earlier pass.
+            // ALL of open/read/rpc1/rpc2 legitimately share client==
+            // 0x3d8740, so this check doesn't disambiguate anything (kept
+            // anyway, harmless and still correct for the real open).
+            //
+            // ROOT CAUSE, actually confirmed by re-reading the two buffers
+            // separately: `kOpenSendBuf` (0x3d7040) is a single FIXED,
+            // GLOBAL scratch buffer that FUN_0011bba8 writes fresh data
+            // into (semToSignal/destPtr/path) before issuing the SIF call,
+            // then reads back (via OUR hook) once WaitSema is reached --
+            // there is no per-call isolation at all. On real hardware this
+            // is presumably safe because of precise IOP/DMA timing
+            // guarantees; our synchronous, cooperatively-scheduled
+            // emulation doesn't replicate that. After enough call volume
+            // (confirmed deterministically stalling at the exact same
+            // semaphore id across independent 150s/240s runs), some OTHER
+            // operation reuses/overwrites `kOpenSendBuf` before THIS open's
+            // in-flight data is read back -- explaining both the garbled
+            // "path" (raw pointer bytes decoding as ASCII "@p=") and the
+            // stale, long-deleted `semToSignal` (64, whose signalSemaphore
+            // call fails with -420) observed live. This is a genuine,
+            // deeper concurrency/serialization gap in how this runtime
+            // models DQ8's shared-scratch-buffer SIF protocol, not a simple
+            // missing-branch bug -- a real fix needs either serializing
+            // access to `kOpenSendBuf` across interleaved callers or
+            // caching this specific call's fields at entry instead of
+            // re-reading them at the wait point. Not attempted yet.
+            else if (recvSize == 4u && rpcNumber == 0u && recvBuf == 0x3d7c80u && sendSize == 0x418u && client == 0x3d8740u)
             {
                 constexpr uint32_t kOpenSendBuf = 0x3D7040u;
-                uint32_t semToSignal = 0u;
-                std::memcpy(&semToSignal, rdram + kOpenSendBuf, sizeof(semToSignal));
+                uint32_t liveSemToSignal = 0u;
+                std::memcpy(&liveSemToSignal, rdram + kOpenSendBuf, sizeof(liveSemToSignal));
+                // REAL FIX (2026-08-28): use the value cached at the moment
+                // FUN_0011bba8 itself wrote it (see g_lastGoodOpenSemToSignal
+                // in ps2_runtime.h) instead of `liveSemToSignal` -- the live
+                // read is racy, since func_11A768's own internal packet
+                // machinery reuses these same bytes (kOpenSendBuf is just
+                // bufPtr+0x40) and can overwrite them before we get here,
+                // confirmed live via a full write-history dump showing the
+                // real semaphore id (416058) legitimately written at
+                // pc=0x11bd2c, then clobbered down to a stale, long-deleted
+                // id (64) by later writes from pc=0x119ac8/0x119b04 (inside
+                // func_11A768's own machinery) before this hook ever read it.
+                const uint32_t semToSignal = g_lastGoodOpenSemToSignal.load(std::memory_order_relaxed);
                 std::string path;
                 for (uint32_t i = 0; i < 0x400u; ++i)
                 {
@@ -2155,8 +2371,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 {
                     s_lastOpenedFileSize.store(size, std::memory_order_relaxed);
                     s_lastOpenedFileLba.store(lba, std::memory_order_relaxed);
-                    uint32_t destPtr = 0u;
-                    std::memcpy(&destPtr, rdram + kOpenSendBuf + 0x4u, sizeof(destPtr));
+                    // Same race/fix as semToSignal above -- use the value
+                    // cached at FUN_0011bba8's own write, not the possibly
+                    // already-clobbered live read.
+                    uint32_t destPtr = g_lastGoodOpenDestPtr.load(std::memory_order_relaxed);
                     destPtr &= 0x1FFFFFFFu;
                     if (destPtr != 0u && destPtr <= PS2_RAM_SIZE - 4u)
                     {
@@ -2175,9 +2393,62 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                     std::cerr << "[sifcall-open-reply] path=\"" << path
                               << "\" lookupPath=\"" << lookupPath << "\" found=" << found
                               << " lba=" << lba << " size=" << size
-                              << " semToSignal=" << semToSignal << std::endl;
+                              << " semToSignal=" << semToSignal
+                              << " liveSemToSignal=" << liveSemToSignal << std::endl;
                 }
-                if (found && semToSignal != 0u && m_eeScheduler)
+                // BUG FIX (2026-08-28): the semaphore signal was gated on
+                // `found`, so a genuinely-not-found file (Locate() returning
+                // false -- confirmed live: the SIF reply correctly writes
+                // reply=-1, but the caller's WaitSema at 0x11bda4/0x11bdac
+                // inside FUN_0011bba8, a DIFFERENT wait site than the one
+                // this whole SIF-reply block otherwise targets, never gets
+                // signaled) left the caller blocked forever instead of
+                // waking up to see the -1 error and handle it normally.
+                // Traced precisely: two independent long runs (150s/240s)
+                // both deterministically stalled at the exact same
+                // semaphore id after thousands of successful open/read
+                // cycles, with the final [dq8-open-waitsema] never followed
+                // by a matching [sifcall-open-signal] -- proving a real
+                // Locate() failure (not a crash, not a resource leak) is
+                // what silently hangs the thread. Always signal, regardless
+                // of found -- the reply value (-1 on failure) already
+                // carries the real outcome for the caller to check.
+                if (!found)
+                {
+                    static std::atomic<uint32_t> s_loggedOpenNotFound{0u};
+                    if (s_loggedOpenNotFound.fetch_add(1u, std::memory_order_relaxed) < 200u)
+                    {
+                        std::cerr << "[sifcall-open-notfound] path=\"" << path
+                                  << "\" lookupPath=\"" << lookupPath << "\""
+                                  << " bufPtr=0x" << std::hex << bufPtr
+                                  << " sendSize=0x" << sendSize
+                                  << " rpcNumber=0x" << rpcNumber << std::dec << std::endl;
+                        std::cerr << "[sifcall-open-notfound-hexdump] kOpenSendBuf(0x3d7040) bytes 0-63: " << std::hex;
+                        for (uint32_t i = 0; i < 64u; ++i)
+                        {
+                            std::cerr << (rdram[kOpenSendBuf + i] < 0x10 ? "0" : "") << (unsigned int)rdram[kOpenSendBuf + i] << " ";
+                        }
+                        std::cerr << std::dec << std::endl;
+                        // DIAGNOSTIC (2026-08-28): dump the kOpenSendBuf write
+                        // history ring buffer (see ps2_runtime.h) to see what
+                        // actually wrote here immediately before this corrupted
+                        // read, in chronological order (oldest recorded entry
+                        // first).
+                        const uint32_t histCount = static_cast<uint32_t>(g_kOpenSendBufWriteHistory.size());
+                        const uint32_t nextIdx = g_kOpenSendBufWriteHistoryIndex.load(std::memory_order_relaxed) % histCount;
+                        std::cerr << "[sifcall-open-notfound-writehistory] last " << histCount
+                                  << " writes to kOpenSendBuf (oldest first):" << std::endl;
+                        for (uint32_t i = 0; i < histCount; ++i)
+                        {
+                            const KOpenSendBufWriteRecord &rec = g_kOpenSendBufWriteHistory[(nextIdx + i) % histCount];
+                            std::cerr << "  #" << i << " addr=0x" << std::hex << rec.addr
+                                      << " size=" << std::dec << rec.size
+                                      << " valueLo=0x" << std::hex << rec.valueLo
+                                      << " pc=0x" << rec.pc << std::dec << std::endl;
+                        }
+                    }
+                }
+                if (semToSignal != 0u && m_eeScheduler)
                 {
                     const int signalResult =
                         m_eeScheduler->signalSemaphore(static_cast<int>(semToSignal), false);
@@ -2316,6 +2587,42 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                         m_eeScheduler->signalSemaphore(static_cast<int>(semToSignal), false);
                     std::cerr << "[sifcall-rpc1-signal] semId=" << semToSignal
                               << " signalResult=" << signalResult << std::endl;
+                }
+            }
+            // FIX (2026-08-28, later session): a FIFTH call shape, from a
+            // DIFFERENT client (0x3dd8c0, not the 0x3d8740 CDVD-filesystem
+            // client all four shapes above belong to) with its own
+            // recv_buf=0x3dd880 and send_size=0x12c (300 bytes). Traced its
+            // caller in full: FUN_0012a670 (via the FUN_0012a970 wrapper)
+            // computes a value via func_119508, embeds it in the send
+            // buffer, makes this call, then -- critically -- its own return
+            // value is NOT func_11A768's v0 (that's always 0 once WaitSema
+            // is reached, confirmed live) but *(uint32_t*)uncached(recv_buf)
+            // itself, read directly via delay-slot code after a trailing
+            // func_116840 call. The outer loop in FUN_00164710 (0x164978-
+            // 0x16498c) retries for as long as that return value is 0.
+            // Since no prior branch ever wrote recv_buf=0x3dd880, it stayed
+            // at its static-init 0, so this retried forever (confirmed live:
+            // identical a0/a1 across 50+ calls, a fresh semaphore id created
+            // every single attempt). Same conservative fix as read/rpc1/
+            // rpc2: a bare non-zero acknowledgement. rpc_number==0 matches
+            // the "open" convention seen on the other client, but this is a
+            // different module entirely (likely an audio/IOP driver resource
+            // registration, given the caller's proximity to the just-fixed
+            // sub_001339F0 interpreter loop that processes DATA.HD6/DATA.DAT
+            // content) -- real semantics not understood beyond "the caller
+            // just needs a nonzero value to stop retrying," so watch for
+            // this proving insufficient downstream the same way the bare
+            // read reply once did.
+            else if (recvSize == 4u && rpcNumber == 0u && recvBuf == 0x3dd880u)
+            {
+                const int32_t reply = 1;
+                std::memcpy(rdram + recvBuf, &reply, sizeof(reply));
+                static std::atomic<uint32_t> s_loggedFifthCallReply{0u};
+                if (s_loggedFifthCallReply.fetch_add(1u, std::memory_order_relaxed) < 100u)
+                {
+                    std::cerr << "[sifcall-rpc0-3dd8c0-reply] bufPtr=0x" << std::hex << bufPtr
+                              << std::dec << std::endl;
                 }
             }
             // EXPERIMENTAL GENERALIZATION (2026-08-27): other call shapes
@@ -2848,6 +3155,21 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     targetFn(rdram, ctx, this);
     --m_nestedCallDepth;
 
+    // FIX (2026-08-28): applied AFTER func_11C1F0 returns, for the same
+    // reason as func_11A588's server-pointer fix below -- see
+    // pendingC1f0DeliveredSize's declaration and the data-delivery hook
+    // above for the full explanation.
+    if (pendingC1f0DeliveredSize != 0u)
+    {
+        setReturnS32(ctx, static_cast<int32_t>(pendingC1f0DeliveredSize));
+        static std::atomic<uint32_t> s_loggedPostCallV0{0u};
+        if (s_loggedPostCallV0.fetch_add(1u, std::memory_order_relaxed) < 30u)
+        {
+            std::cerr << "[postcall-c1f0-v0-set] size=0x" << std::hex << pendingC1f0DeliveredSize
+                      << " v0now=0x" << getRegU32(ctx, 2) << std::dec << std::endl;
+        }
+    }
+
     // FIX (see project memory, 2026-08-26): applied AFTER func_11A588
     // returns (writing before the call gets silently overwritten by the
     // function's own client-struct initialization -- confirmed empirically,
@@ -3010,6 +3332,19 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             std::cerr << "[func11a588-real-return] #" << std::dec << n
                       << " v0=0x" << std::hex << getRegU32(ctx, 2)
                       << " pcAfter=0x" << ctx->pc
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (pendingC1f0DeliveredSize != 0u)
+    {
+        static std::atomic<uint32_t> s_loggedEndOfFuncV0{0u};
+        if (s_loggedEndOfFuncV0.fetch_add(1u, std::memory_order_relaxed) < 30u)
+        {
+            std::cerr << "[c1f0-end-of-dispatch-v0] v0=0x" << std::hex << getRegU32(ctx, 2)
+                      << " ctxPc=0x" << ctx->pc << " entryPc=0x" << entryPc
+                      << " fallthroughPc=0x" << fallthroughPc
+                      << " isStopRequested=" << isStopRequested()
                       << std::dec << std::endl;
         }
     }

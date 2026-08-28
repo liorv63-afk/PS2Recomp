@@ -4,6 +4,7 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
@@ -1835,10 +1836,58 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     {
         if (m_path3Masked)
         {
+            // DIAGNOSTIC (see project memory, 2026-08-25): confirm whether
+            // DQ8's own MSKPATH3 usage is masking path3 forever, silently
+            // queuing every packet here without ever reaching the GS
+            // backend -- checking against the black-screen mystery.
+            static std::atomic<uint64_t> s_maskedCount{0u};
+            const uint64_t n = s_maskedCount.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 20u)
+            {
+                std::cerr << "[path3-masked-queue] #" << n
+                          << " sizeBytes=" << sizeBytes
+                          << " fifoDepth=" << (m_path3MaskedFifo.size() + 1u) << std::endl;
+            }
             m_path3MaskedFifo.emplace_back(data, data + sizeBytes);
             return;
         }
         flushMaskedPath3Packets(false);
+    }
+
+    // DIAGNOSTIC (see project memory, 2026-08-25): decode the raw GIF tag
+    // header of every real submitted packet -- NLOOP/EOP/FLG/NREG -- to see
+    // what DQ8 is actually sending, since gifCopyCount is nonzero but the
+    // screen stays black.
+    {
+        static std::atomic<uint32_t> s_loggedSubmit{0u};
+        if (s_loggedSubmit.fetch_add(1u, std::memory_order_relaxed) < 20u && sizeBytes >= 16u)
+        {
+            uint64_t tagLo = 0u, tagHi = 0u;
+            std::memcpy(&tagLo, data, sizeof(tagLo));
+            std::memcpy(&tagHi, data + 8, sizeof(tagHi));
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint32_t eop = static_cast<uint32_t>((tagLo >> 15) & 0x1u);
+            const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+            if (nreg == 0u) nreg = 16u;
+            const uint32_t reg0 = static_cast<uint32_t>(tagHi & 0xFu);
+            // If reg0==0xE (A+D mode), the very first data qword's high
+            // 64 bits give the real target register address at bits 64-71.
+            uint32_t adDestReg = 0xFFu;
+            if (reg0 == 0xEu && sizeBytes >= 32u)
+            {
+                uint64_t firstHi = 0u;
+                std::memcpy(&firstHi, data + 16 + 8, sizeof(firstHi));
+                adDestReg = static_cast<uint32_t>(firstHi & 0xFFu);
+            }
+            std::cerr << "[gif-tag-submit] path=" << static_cast<int>(pathId)
+                      << " sizeBytes=" << sizeBytes
+                      << " nloop=" << nloop << " eop=" << eop
+                      << " flg=" << flg << " nreg=" << nreg
+                      << " reg0=0x" << std::hex << reg0
+                      << " adDestReg=0x" << adDestReg
+                      << " raw=0x" << tagLo << std::dec << std::endl;
+        }
     }
 
     if (m_gifArbiter)

@@ -5,6 +5,7 @@
 #include "runtime/ps2_address.h"
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <map>
 #include <vector>
@@ -73,7 +74,15 @@ namespace ps2_stubs
         constexpr uint32_t kSifRegMainAddr = 0x80000000u;
         constexpr uint32_t kSifRegSubAddr = 0x80000001u;
         constexpr uint32_t kSifRegMsCom = 0x80000002u;
-        constexpr uint32_t kSifBootReadyMask = 0x00020000u;
+        // Real ps2sdk status bits (common/include, confirmed 2026-08-25):
+        // SIF_STAT_SIFINIT=0x10000, SIF_STAT_CMDINIT=0x20000,
+        // SIF_STAT_BOOTEND=0x40000. This runtime never runs a real IOP boot
+        // sequence, so the honest steady-state answer to "has the IOP
+        // finished booting" is "yes" -- seed all three, not just CMDINIT.
+        // (DQ8's FUN_0011ff00, called from FUN_00160b00, was found spinning
+        // forever polling this exact register for the BOOTEND bit alone,
+        // which the previous CMDINIT-only seed never set.)
+        constexpr uint32_t kSifBootReadyMask = 0x00070000u;
 
         void seedDefaultSifRegsLocked()
         {
@@ -815,6 +824,14 @@ namespace ps2_stubs
         std::array<Ps2SifDmaTransfer, 32u> pending{};
         uint32_t pendingCount = 0u;
         bool ok = true;
+        // TEMPORARY DIAGNOSTIC (2026-08-27, see project memory): the
+        // existing failure log below is gated behind PS2_IF_AGRESSIVE_LOGS
+        // (off by default), so a real DQ8 SIF-DMA failure (a 128-byte
+        // client 0x3dd980 SifCallRpc send that never reaches WaitSema) was
+        // invisible all session. Capture exactly which check rejects it and
+        // the specific descriptor values, always-on but capped.
+        const char *failReason = nullptr;
+        uint32_t failSrc = 0u, failDst = 0u, failSize = 0u;
         for (uint32_t i = 0; i < count; ++i)
         {
             const uint32_t entryAddr = dmatAddr + (i * static_cast<uint32_t>(sizeof(Ps2SifDmaTransfer)));
@@ -822,6 +839,7 @@ namespace ps2_stubs
             if (!entry)
             {
                 ok = false;
+                failReason = "entryAddr out of range";
                 break;
             }
 
@@ -836,11 +854,15 @@ namespace ps2_stubs
             if (sizeBytes > PS2_RAM_SIZE)
             {
                 ok = false;
+                failReason = "size > PS2_RAM_SIZE";
+                failSrc = xfer.src; failDst = xfer.dest; failSize = sizeBytes;
                 break;
             }
             if (!canCopyGuestByteRange(rdram, xfer.dest, xfer.src, sizeBytes))
             {
                 ok = false;
+                failReason = "canCopyGuestByteRange rejected";
+                failSrc = xfer.src; failDst = xfer.dest; failSize = sizeBytes;
                 break;
             }
 
@@ -865,6 +887,8 @@ namespace ps2_stubs
                 if (!copyGuestByteRange(rdram, xfer.dest, xfer.src, static_cast<uint32_t>(xfer.size)))
                 {
                     ok = false;
+                    failReason = "copyGuestByteRange failed";
+                    failSrc = xfer.src; failDst = xfer.dest; failSize = static_cast<uint32_t>(xfer.size);
                     break;
                 }
                 if (runtime)
@@ -891,6 +915,14 @@ namespace ps2_stubs
                               << std::dec << std::endl;
                 });
                 ++warnCount;
+            }
+            static std::atomic<uint32_t> s_loggedSetDmaFail{0u};
+            if (s_loggedSetDmaFail.fetch_add(1u, std::memory_order_relaxed) < 60u)
+            {
+                std::cerr << "[sceSifSetDma-fail] reason=" << (failReason ? failReason : "unknown")
+                          << " dmat=0x" << std::hex << dmatAddr << " count=" << std::dec << count
+                          << " src=0x" << std::hex << failSrc << " dst=0x" << failDst
+                          << " size=0x" << failSize << std::dec << std::endl;
             }
             setReturnS32(ctx, 0);
             return;
@@ -919,7 +951,19 @@ namespace ps2_stubs
             {
                 prev = it->second;
             }
-            g_sifRegs[reg] = value;
+            // FIX (see project memory, 2026-08-25): register 4
+            // (kSifRegBootStatus) holds accumulating status bits
+            // (SIF_STAT_SIFINIT=0x10000, SIF_STAT_CMDINIT=0x20000,
+            // SIF_STAT_BOOTEND=0x40000 -- confirmed against real ps2sdk
+            // headers). DQ8's own SIF init code writes these one bit at a
+            // time in immediate succession (0x40000, then 0x10000, then
+            // 0x20000) and then polls for the first bit -- which only makes
+            // sense if writes accumulate (OR) rather than replace; a plain
+            // overwrite here left only the last bit set and made
+            // FUN_0011ff00's BOOTEND poll spin forever. Other registers
+            // (MainAddr/SubAddr/MsCom, etc.) hold genuine values, not flag
+            // bits, and must still be overwritten normally.
+            g_sifRegs[reg] = (reg == kSifRegBootStatus) ? (prev | value) : value;
             shouldLog = shouldTraceSifReg(reg) && g_sifSetRegLogCount < 128u;
             if (shouldLog)
             {

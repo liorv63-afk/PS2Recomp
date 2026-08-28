@@ -246,6 +246,13 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
+    void SifInitRpcDirectCallBridge(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t returnAddr = getRegU32(ctx, 31);
+        SifInitRpc(rdram, ctx, runtime);
+        ctx->pc = returnAddr;
+    }
+
     void SifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t clientPtr = getRegU32(ctx, 4);

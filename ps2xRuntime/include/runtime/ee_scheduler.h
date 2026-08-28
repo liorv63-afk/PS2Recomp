@@ -354,6 +354,7 @@ public:
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
     void publishSnapshot();
+    void debugDumpIrqHandlers() const;
 
 private:
     struct ScheduledEvent

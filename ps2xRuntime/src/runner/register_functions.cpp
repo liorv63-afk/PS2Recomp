@@ -182369,6 +182369,13 @@ static void InitChunk_FullRangeFixes(PS2Runtime::RecompiledFunction* table) {
     RegisterFullRangeFix(table, 0x161880u, 0x161b50u, FUN_00161880_0x161880);
     // FUN_00167270: was 0x167270-0x1673a4, missing e.g. 0x167388.
     RegisterFullRangeFix(table, 0x167270u, 0x1673e0u, FUN_00167270_0x167270);
+    // FUN_0011c1f0: was 0x11c1f0-0x11c30c, fell through into separately
+    // fragmented entry_ stubs instead of being recognized as one function.
+    RegisterFullRangeFix(table, 0x11c1f0u, 0x11cc90u, FUN_0011c1f0_0x11c1f0);
+    // FUN_0017ffb0: was a ps2_stubs::TODO_NAMED placeholder (the recompiler
+    // had excluded the real, much larger function as "pathological" --
+    // recovered the complete translation from dq8_r5900's archived output).
+    RegisterFullRangeFix(table, 0x17ffb0u, 0x1819d4u, FUN_0017ffb0_0x17ffb0);
 }
 
 struct GeneratedFunctionTableInitializer {

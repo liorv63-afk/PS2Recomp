@@ -236,6 +236,45 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
+// DIAGNOSTIC (2026-08-28): kOpenSendBuf (0x3D7040, FUN_0011bba8's own fixed
+// scratch buffer for the file-open SIF call) has no per-call isolation --
+// confirmed live that after enough call volume, some other operation
+// overwrites it before an in-flight open's data is read back, corrupting
+// the reply and permanently hanging the caller (see project memory,
+// 2026-08-28). Rather than logging every write (this buffer is touched
+// extremely often during normal operation -- would flood the log long
+// before reaching the rare corruption), keep a small ring buffer of the
+// most recent writes; ps2_runtime.cpp dumps it only when it detects the
+// corrupted-read symptom, showing exactly what wrote here immediately
+// before the failure.
+struct KOpenSendBufWriteRecord
+{
+    uint32_t addr = 0u;
+    uint32_t size = 0u;
+    uint64_t valueLo = 0u;
+    uint32_t pc = 0u;
+};
+inline std::array<KOpenSendBufWriteRecord, 32> g_kOpenSendBufWriteHistory{};
+inline std::atomic<uint32_t> g_kOpenSendBufWriteHistoryIndex{0u};
+
+// REAL FIX (2026-08-28): the write-history ring buffer above proved
+// kOpenSendBuf+0x0 (the semaphore id FUN_0011bba8 wants signaled once its
+// SIF call completes) gets legitimately written once by FUN_0011bba8 itself
+// (pc in its own 0x11bba8-0x11be38 range), then LATER overwritten by
+// func_11A768's own internal packet-construction machinery (pc in the
+// 0x119xxx-0x11axxx range, reusing the exact same fixed bufPtr=0x3d7000
+// address, which kOpenSendBuf is just +0x40 into) before our SIF-reply hook
+// ever gets to read it -- by the time we read, we get whatever THAT other
+// machinery left behind, not FUN_0011bba8's real value. Caching the value
+// at the moment FUN_0011bba8 itself writes it (identified by pc range, not
+// by re-deriving it from the same racy shared memory) sidesteps the race
+// entirely for this one critical field.
+inline std::atomic<uint32_t> g_lastGoodOpenSemToSignal{0u};
+// Same race, same fix, for the destPtr field (kOpenSendBuf+0x4) -- confirmed
+// live in the same write-history dump: correctly written 0x1fff9b0 at
+// pc=0x11bd24, then clobbered to 0 at pc=0x119ac4 before our hook read it.
+inline std::atomic<uint32_t> g_lastGoodOpenDestPtr{0u};
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -370,6 +409,26 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
+    // Temporary watchpoint (2026-08-28): FUN_00165570 calls FUN_00165c00
+    // (DQ8's own token/script dispatcher) with a1(cursor)/a2 read from the
+    // SAME entity struct's own fields at +0xB4/+0xB8 (entity base 0x3f17b0,
+    // so 0x3f1864/0x3f1868) -- confirmed live both are always 0 (a null
+    // cursor), which is why the dispatcher only ever sees an empty/idle
+    // state and never processes real script content. Neither field falls
+    // within the existing 0x3f17b0-0x3f17e0 watch range above. Does ANYTHING
+    // ever write a real (nonzero) value here?
+    if (guestAddr >= 0x3f1860u && guestAddr < 0x3f1870u)
+    {
+        static std::atomic<uint32_t> s_watchCursorLogCount{0u};
+        if (s_watchCursorLogCount.fetch_add(1u, std::memory_order_relaxed) < 20000u)
+        {
+            std::cerr << "[watch-3f1864-cursor] addr=0x" << std::hex << guestAddr
+                      << " size=" << std::dec << size
+                      << " valueLo=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << std::dec << std::endl;
+        }
+    }
     // Temporary watchpoint (2026-08-27): does ANYTHING ever write into the
     // 32-slot/16-byte-stride file-descriptor table at 0x3D8540-0x3D8740
     // (confirmed shared between FUN_0011bba8's open, func_11AF88's slot
@@ -389,6 +448,31 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                       << " valueLo=0x" << std::hex << valueLo
                       << " pc=0x" << (ctx ? ctx->pc : 0u)
                       << std::dec << std::endl;
+        }
+    }
+    // kOpenSendBuf write-history ring buffer (see struct comment above) --
+    // covers the full 0x418-byte send buffer (the actual open payload can
+    // be that large), not just the small header fields, since the
+    // corruption's exact shape isn't known in advance.
+    if (guestAddr >= 0x3d7040u && guestAddr < 0x3d7040u + 0x418u)
+    {
+        const uint32_t idx = g_kOpenSendBufWriteHistoryIndex.fetch_add(1u, std::memory_order_relaxed) %
+                              static_cast<uint32_t>(g_kOpenSendBufWriteHistory.size());
+        g_kOpenSendBufWriteHistory[idx] = KOpenSendBufWriteRecord{guestAddr, size, valueLo, ctx ? ctx->pc : 0u};
+
+        // Cache the semaphore id the moment FUN_0011bba8 itself writes it
+        // (pc within its own function body), before func_11A768's internal
+        // machinery gets a chance to overwrite the same bytes.
+        if (ctx && ctx->pc >= 0x11bba8u && ctx->pc < 0x11be38u)
+        {
+            if (guestAddr == 0x3d7040u && size == 4u)
+            {
+                g_lastGoodOpenSemToSignal.store(static_cast<uint32_t>(valueLo), std::memory_order_relaxed);
+            }
+            else if (guestAddr == 0x3d7044u && size == 4u)
+            {
+                g_lastGoodOpenDestPtr.store(static_cast<uint32_t>(valueLo), std::memory_order_relaxed);
+            }
         }
     }
     // Temporary watchpoint (2026-08-27): trace the full lifecycle of the

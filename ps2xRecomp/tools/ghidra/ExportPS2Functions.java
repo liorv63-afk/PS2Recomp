@@ -3,6 +3,7 @@
 
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.listing.Instruction;
@@ -555,6 +556,70 @@ public class ExportPS2Functions extends GhidraScript {
             existingStarts.add(start);
         }
 
+        // Third pass: cover every remaining gap of disassembled-but-unclaimed instructions,
+        // regardless of whether Ghidra found a static reference to it. Code reached only
+        // through a dynamically-constructed pointer (e.g. registered via SetSyscall) has
+        // no callable reference for hasCallableLabelReference() to find, but it is still
+        // real, reachable code that needs its own recompiled function.
+        List<FunctionRecord> sortedFunctions = new ArrayList<>(functionRecords);
+        sortedFunctions.sort(Comparator.comparingLong(r -> r.start));
+        long[] fnStarts = new long[sortedFunctions.size()];
+        long[] fnEnds = new long[sortedFunctions.size()];
+        for (int i = 0; i < sortedFunctions.size(); i++) {
+            fnStarts[i] = sortedFunctions.get(i).start;
+            fnEnds[i] = sortedFunctions.get(i).endExclusive;
+        }
+
+        InstructionIterator gapInstructions = currentProgram.getListing().getInstructions(executableAddresses, true);
+        while (gapInstructions.hasNext() && !monitor.isCancelled()) {
+            Instruction instruction = gapInstructions.next();
+            if (instruction == null) {
+                continue;
+            }
+
+            long start = instruction.getAddress().getOffset();
+            if (existingStarts.contains(start)) {
+                continue;
+            }
+
+            int idx = Arrays.binarySearch(fnStarts, start);
+            int coveringIdx = (idx >= 0) ? idx : (-idx - 2);
+            if (coveringIdx >= 0 && start < fnEnds[coveringIdx]) {
+                continue; // inside an existing function's body: not a gap at all
+            }
+
+            // A delay-slot instruction must never become its own synthetic function:
+            // splitting it off from the branch/jump that owns it means the delay slot
+            // (which the recompiler expects to execute as part of that branch) never
+            // runs at all. Concretely this broke a `jr $ra` whose delay slot computed
+            // the real return value (`daddu v0, a0, zero`) -- the jr returned
+            // immediately, v0 kept a stale value from the preceding comparison instead,
+            // and the caller silently got a wrong result on every call. Skip creating an
+            // entry here; the owning branch's synthetic function absorbs this address
+            // via the normal endExclusive boundary-clipping below.
+            Address prevAddress = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(start - 4L);
+            Instruction prevInstruction = currentProgram.getListing().getInstructionAt(prevAddress);
+            if (prevInstruction != null && prevInstruction.getDelaySlotDepth() > 0) {
+                continue;
+            }
+
+            // Every unclaimed instruction becomes its own synthetic function start,
+            // not just the first one in a run. A merged multi-instruction gap function
+            // would only get a resume switch-case at addresses reachable by an
+            // internal branch; an externally-referenced mid-gap address (e.g. a
+            // SetSyscall handler pointer, known only at emulation runtime) would
+            // silently execute from the wrong offset instead of failing loudly.
+            // Fallthrough between these one-per-instruction entries is already proven
+            // to work correctly (this is the same mechanism that bridges the boot
+            // entry point into the code immediately following it).
+            FunctionRecord record = new FunctionRecord();
+            record.name = makeAnonymousEntryName(start);
+            record.start = start;
+            record.syntheticEntry = true;
+            labelRecords.add(record);
+            existingStarts.add(start);
+        }
+
         if (labelRecords.isEmpty()) {
             return labelRecords;
         }
@@ -637,8 +702,21 @@ public class ExportPS2Functions extends GhidraScript {
             FunctionRecord record = new FunctionRecord();
             record.name = func.getName();
             record.start = func.getEntryPoint().getOffset();
-            record.endExclusive = body.getMaxAddress().getOffset() + 1L;
-            record.size = body.getNumAddresses();
+
+            // A function's body can be non-contiguous in Ghidra (a stray disjoint
+            // range folded in by a decompiler/analysis quirk). Using the body's overall
+            // getMaxAddress() in that case can report an End far beyond the function's
+            // real, contiguous code -- the recompiler then tries to decode everything
+            // in between (including unrelated code and data) as this one function's
+            // body. Use only the address range that actually contains the entry point.
+            AddressRange entryRange = body.getRangeContaining(func.getEntryPoint());
+            if (entryRange != null) {
+                record.endExclusive = entryRange.getMaxAddress().getOffset() + 1L;
+                record.size = entryRange.getLength();
+            } else {
+                record.endExclusive = body.getMaxAddress().getOffset() + 1L;
+                record.size = body.getNumAddresses();
+            }
             functionRecords.add(record);
 
             ClassificationResult classification = classifyFunction(func);

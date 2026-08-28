@@ -17,4 +17,10 @@ namespace ps2_syscalls
     void sceSifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceRpcGetPacket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    // Direct-call wrapper around SifInitRpc for binding to a JAL target (via a
+    // game override) instead of a SYSCALL trap. SifInitRpc itself never touches
+    // ctx->pc (correct for the syscall calling convention, where the caller's own
+    // generated code continues linearly); this wrapper adds the explicit
+    // "return to $ra" step that a direct-call replacement needs.
+    void SifInitRpcDirectCallBridge(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 }

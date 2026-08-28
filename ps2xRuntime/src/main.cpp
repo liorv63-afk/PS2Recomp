@@ -201,7 +201,11 @@ int main(int argc, char *argv[])
             [](PS2Runtime &rt, void *userData)
             {
                 (void)rt;
-                static_cast<PS2DebugPanel *>(userData)->initialize();
+                auto *panel = static_cast<PS2DebugPanel *>(userData);
+                panel->initialize();
+                // Start hidden so the GS framebuffer is visible by default;
+                // toggle back on with F1 for interactive debugging.
+                panel->setVisible(false);
             },
             [](PS2Runtime &rt, void *userData)
             {

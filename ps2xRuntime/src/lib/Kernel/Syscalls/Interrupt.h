@@ -18,6 +18,14 @@ namespace ps2_syscalls
     void AddDmacHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void AddDmacHandler2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void RemoveDmacHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    // Bridge for games that statically link PS2SDK's own libkernel AddIntcHandler
+    // implementation (writing directly into a game-local copy of the kernel INTC
+    // handler table) instead of calling the AddIntcHandler syscall. Bind a game
+    // override to the address of that inlined routine so its registration reaches
+    // our host-side EeScheduler and can actually be dispatched.
+    // Expected register convention at entry, matching PS2SDK's AddIntcHandler(cause, handler, arg):
+    //   a0 = cause, a2 = handler function address, a3 = argument, gp = handler's gp.
+    void LinkedIntcHandlerBridge(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void EnableIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void DisableIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void EnableDmacHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

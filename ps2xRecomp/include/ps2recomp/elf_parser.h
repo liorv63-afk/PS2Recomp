@@ -41,6 +41,14 @@ namespace ps2recomp
                 void setReporter(RecompilerReporter *reporter);
                 void debugAddress(uint32_t address) const;
 
+                // Call before parse() when a Ghidra function map will be loaded
+                // afterward via loadGhidraFunctionMap(). Without this, parse()'s
+                // DWARF-then-JAL-scan fallback can populate m_extraFunctions with its
+                // own heuristic function boundaries first (since no DWARF info exists
+                // in a stripped retail binary), and those can end up winning over the
+                // Ghidra map's correct, authoritative boundaries for the same address.
+                void setSkipJalScanFallback(bool skip);
+
         private:
                 std::string m_filePath;
                 std::unique_ptr<ELFIO::elfio> m_elf;
@@ -50,6 +58,7 @@ namespace ps2recomp
                 std::vector<Relocation> m_relocations;
                 std::vector<Function> m_extraFunctions;
                 bool m_hasLoadedGhidraMap = false;
+                bool m_skipJalScanFallback = false;
                 RecompilerReporter *m_reporter = nullptr;
                 std::unordered_set<uint32_t> m_ghidraMapStarts;
 
