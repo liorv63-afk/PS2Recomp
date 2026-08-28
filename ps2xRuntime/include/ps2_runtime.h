@@ -289,6 +289,39 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     (void)valueHi;
     (void)op;
 
+    // DIAGNOSTIC (2026-08-28): resolving a real contradiction in project
+    // memory around FUN_0012a670 (thread 9's real "cdrom"-mode open call):
+    // its guard DAT_0039270c reads 0 (success-looking) on the 2nd+ entry,
+    // but the one independently-logged bind attempt for the SID it retries
+    // on (0x80000597, client 0x3dd8c0) shows v0=-1 (fail). Watching every
+    // write to the guard (0x39270c) and its loop's break condition
+    // (iRam003dd8e4, address 0x3dd8e4) to see exactly which code path sets
+    // each, and in what order, to resolve the contradiction directly
+    // rather than guessing.
+    if (guestAddr >= 0x39270cu && guestAddr < 0x392710u)
+    {
+        static std::atomic<uint32_t> s_watchGuard39270cLogCount{0u};
+        if (s_watchGuard39270cLogCount.fetch_add(1u, std::memory_order_relaxed) < 100u)
+        {
+            std::cerr << "[watch-39270c-guard] addr=0x" << std::hex << guestAddr
+                      << " size=" << std::dec << size
+                      << " valueLo=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << std::dec << std::endl;
+        }
+    }
+    if (guestAddr >= 0x3dd8e0u && guestAddr < 0x3dd8e8u)
+    {
+        static std::atomic<uint32_t> s_watch3dd8e4LogCount{0u};
+        if (s_watch3dd8e4LogCount.fetch_add(1u, std::memory_order_relaxed) < 100u)
+        {
+            std::cerr << "[watch-3dd8e4-breakcond] addr=0x" << std::hex << guestAddr
+                      << " size=" << std::dec << size
+                      << " valueLo=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << std::dec << std::endl;
+        }
+    }
     // DIAGNOSTIC (2026-08-28): FUN_00160530, the real VBLANK interrupt
     // handler (see project memory), calls a registered callback function
     // pointer at 0x3d26bc if non-null, immediately after reading the

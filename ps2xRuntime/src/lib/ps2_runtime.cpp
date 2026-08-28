@@ -2090,6 +2090,32 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
+    if (targetPc == 0x12a670u)
+    {
+        // DIAGNOSTIC (2026-08-28): FUN_0012a670 is, per Ghidra decompile
+        // (see project memory), the real "cdrom" disc-open initiator
+        // (device-table index 4). It contains a hardcoded infinite
+        // busy-wait retry loop binding SID 0x80000597 (client 0x3dd8c0),
+        // one of the 3 confirmed-permanently-failing SIF binds -- but is
+        // guarded by an "already initialized" flag (DAT_0039270c) that may
+        // skip the retry loop after the first successful pass. Checking
+        // whether this function is ever entered, and how many times the
+        // guarded bind loop actually iterates.
+        static std::atomic<uint32_t> s_callsRealCdromOpen{0u};
+        const uint32_t n = s_callsRealCdromOpen.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 50u)
+        {
+            uint32_t guardValue = 0xdeadbeefu;
+            if (rdram && 0x39270cu <= PS2_RAM_SIZE - 4u)
+            {
+                std::memcpy(&guardValue, rdram + 0x39270cu, sizeof(guardValue));
+            }
+            std::cerr << "[real-cdrom-open-entry] #" << std::dec << n
+                       << " source=0x" << std::hex << sourcePc
+                       << " guardDAT_0039270c=0x" << guardValue << std::dec << std::endl;
+        }
+    }
+
     if (targetPc == 0x1693b0u)
     {
         // DIAGNOSTIC (2026-08-28): FUN_001693b0 is, per Ghidra decompile
