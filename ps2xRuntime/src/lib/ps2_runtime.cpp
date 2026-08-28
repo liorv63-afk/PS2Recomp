@@ -2090,6 +2090,50 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
+    if (targetPc == 0x1690e0u)
+    {
+        // DIAGNOSTIC (2026-08-28): re-checking whether FUN_001690e0 (labeled
+        // "confirmed main per-frame dispatcher" earlier this session based on
+        // it calling ~25 different subsystem functions) is actually called
+        // repeatedly, or just once -- prompted by one of its callees
+        // (FUN_00160330) turning out, on Ghidra disassembly, to look like a
+        // one-time init routine (allocator setup, DMA channel reset,
+        // subsystem table setup), not per-frame draw code.
+        static std::atomic<uint32_t> s_calls1690e0{0u};
+        const uint32_t n = s_calls1690e0.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 50u)
+        {
+            std::cerr << "[call-1690e0] #" << std::dec << n
+                       << " source=0x" << std::hex << sourcePc << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x1092b8u || targetPc == 0x109710u)
+    {
+        // DIAGNOSTIC (2026-08-28): these two low-address SDK-region
+        // functions are the only generated code referencing the literal
+        // VIF1 register-block base constant (0x10009xxx, lui 0x1000 + ori
+        // 0x9000) outside of a handful of unrelated matches -- strong
+        // candidates for the real sceDmaSend/VU1-upload library helper(s).
+        // Counting calls to see whether they're ever reached at all during
+        // the boot window, given [vif1-reg-write] shows VIF1's registers
+        // are only ever zeroed once and never configured with real data.
+        static std::atomic<uint32_t> s_calls1092b8{0u};
+        static std::atomic<uint32_t> s_calls109710{0u};
+        const uint32_t n = (targetPc == 0x1092b8u)
+                                ? s_calls1092b8.fetch_add(1u, std::memory_order_relaxed)
+                                : s_calls109710.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 50u)
+        {
+            std::cerr << "[dma-helper-call] target=0x" << std::hex << targetPc
+                       << " source=0x" << sourcePc
+                       << " a0=0x" << getRegU32(ctx, 4)
+                       << " a1=0x" << getRegU32(ctx, 5)
+                       << " a2=0x" << getRegU32(ctx, 6)
+                       << std::dec << std::endl;
+        }
+    }
+
     if (targetPc == 0x116860u && sourcePc == 0x1660ccu)
     {
         // DIAGNOSTIC (2026-08-28): FUN_00166080 (called every tick from the

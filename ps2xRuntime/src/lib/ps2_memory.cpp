@@ -1268,6 +1268,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (address >= 0x10008000 && address < 0x1000F000)
     {
+        // DIAGNOSTIC (2026-08-28): confirmed via [dma-state]/D_STAT that VIF1
+        // (channel base 0x10009000, which feeds VU1 -- the geometry
+        // microprogram path virtually all real PS2 3D rendering goes
+        // through) never completes a transfer all session, while VIF0 and
+        // GIF-direct both do. Logging every raw write anywhere in the
+        // VIF1 channel's register block (CHCR/MADR/QWC/TADR/etc, offsets
+        // 0x00-0xFF from 0x10009000) to see whether guest code ever
+        // touches VIF1 at all, even without ever setting the STR bit.
+        if ((address & 0xFFFFFF00u) == 0x10009000u)
+        {
+            static std::atomic<uint32_t> s_loggedVif1RegWrite{0u};
+            if (s_loggedVif1RegWrite.fetch_add(1u, std::memory_order_relaxed) < 100u)
+            {
+                std::cerr << "[vif1-reg-write] addr=0x" << std::hex << address
+                          << " offset=0x" << (address & 0xFFu)
+                          << " value=0x" << value << std::dec << std::endl;
+            }
+        }
         if ((address & 0xFF) == 0x00 && (value & 0x100))
         {
             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);

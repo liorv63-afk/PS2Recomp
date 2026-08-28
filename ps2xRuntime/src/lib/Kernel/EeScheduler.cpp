@@ -546,8 +546,21 @@ void EeScheduler::run()
                               << " pc=0x" << std::hex << t.context.pc << std::dec
                               << " waitReason=" << static_cast<int>(t.wait.reason)
                               << " invocationDepth=" << t.invocations.size()
-                              << " priority=" << t.currentPriority
-                              << std::endl;
+                              << " priority=" << t.currentPriority;
+                    // DIAGNOSTIC (2026-08-28): surface which semaphore a
+                    // blocked thread is actually waiting on, to identify the
+                    // specific unsignaled semaphore each of the 7 permanently
+                    // deadlocked worker threads is stuck on (see project
+                    // memory -- every worker thread besides #4 sits frozen at
+                    // one PC the entire run with waitReason=Semaphore).
+                    if (t.wait.reason == EeWaitReason::Semaphore)
+                    {
+                        if (const auto *semWait = std::get_if<EeSemaphoreWait>(&t.wait.payload))
+                        {
+                            std::cerr << " semId=" << semWait->id;
+                        }
+                    }
+                    std::cerr << std::endl;
                 }
                 // DIAGNOSTIC (see project memory, 2026-08-25): re-check
                 // whether DQ8 has by now registered a VBlank INTC handler

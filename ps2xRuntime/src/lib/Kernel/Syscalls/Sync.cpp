@@ -62,6 +62,21 @@ namespace ps2_syscalls
                               << " callerThreadId=" << ee.currentThreadId()
                               << " callerPc=0x" << std::hex << ctx->pc << std::dec << std::endl;
                 }
+                // DIAGNOSTIC (2026-08-28): any SignalSema attempt (successful
+                // or not) targeting one of the 7 deadlocked threads' semIds
+                // (see project memory) -- if this NEVER fires for a given id,
+                // no guest code anywhere even attempts to signal it during
+                // the capture window, which is itself a key data point.
+                static std::atomic<uint32_t> s_targetSignalLogCount{0u};
+                if ((semId == 66 || semId == 86 || semId == 90 || semId == 96 || semId == 131 ||
+                     semId == 205) &&
+                    s_targetSignalLogCount.fetch_add(1u, std::memory_order_relaxed) < 50u)
+                {
+                    std::cerr << "[SignalSema-deadlock-target] id=" << semId << " result=" << result
+                              << " interruptSafe=" << interruptSafe
+                              << " callerThreadId=" << ee.currentThreadId()
+                              << " callerPc=0x" << std::hex << ctx->pc << std::dec << std::endl;
+                }
             }
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
@@ -104,11 +119,11 @@ namespace ps2_syscalls
 
         // ee_sema_t from ps2sdk. The IOP attr/option/init/max ordering is not
         // accepted by the EE runtime.
-        const int semId = scheduler(rdram, ctx, runtime)
-                               .createSemaphore(param->init_count,
-                                                 param->max_count,
-                                                 param->attr,
-                                                 param->option);
+        EeScheduler &ee0 = scheduler(rdram, ctx, runtime);
+        const int semId = ee0.createSemaphore(param->init_count,
+                                               param->max_count,
+                                               param->attr,
+                                               param->option);
         {
             static std::atomic<uint32_t> s_createSemaLogCount{0u};
             if (s_createSemaLogCount.fetch_add(1u, std::memory_order_relaxed) < 20u)
@@ -117,6 +132,25 @@ namespace ps2_syscalls
                           << " initCount=" << std::dec << param->init_count
                           << " maxCount=" << param->max_count
                           << " -> id=" << semId << std::endl;
+            }
+            // DIAGNOSTIC (2026-08-28): the 7 permanently-deadlocked worker
+            // threads found this session (see project memory) block on
+            // semIds 3/66/86/90/96/131/205 -- the generic [CreateSema] log
+            // above is capped at 20 and these IDs are created well past
+            // that. Always-on (capped separately) logging of exactly these
+            // 7 IDs' creation, with caller PC/thread, to find which guest
+            // function creates each one.
+            static std::atomic<uint32_t> s_targetSemaLogCount{0u};
+            if ((semId == 3 || semId == 66 || semId == 86 || semId == 90 || semId == 96 ||
+                 semId == 131 || semId == 205) &&
+                s_targetSemaLogCount.fetch_add(1u, std::memory_order_relaxed) < 50u)
+            {
+                std::cerr << "[CreateSema-target] id=" << semId
+                          << " paramAddr=0x" << std::hex << address
+                          << " initCount=" << std::dec << param->init_count
+                          << " maxCount=" << param->max_count
+                          << " callerPc=0x" << std::hex << ctx->pc << std::dec
+                          << " callerThreadId=" << ee0.currentThreadId() << std::endl;
             }
         }
         setReturnS32(ctx, semId);
