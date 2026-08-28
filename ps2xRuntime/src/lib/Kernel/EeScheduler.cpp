@@ -700,6 +700,35 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
 
+    // DIAGNOSTIC (2026-08-28, see project memory): a prior experimental fix
+    // (forcing due=true when currentThread()==nullptr) never fired and did
+    // not stop the unbounded m_nestedCallDepth growth observed after
+    // thread 1 goes dormant -- meaning `running` stays non-null throughout.
+    // Sampling this function's own decision periodically to see exactly
+    // what it's seeing/deciding once the runaway growth is already
+    // underway.
+    {
+        static std::atomic<int64_t> s_checkpointDiagMs{0};
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        int64_t last = s_checkpointDiagMs.load(std::memory_order_relaxed);
+        if (nowMs - last >= 250 &&
+            s_checkpointDiagMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed))
+        {
+            const GuestThread *diagRunning = currentThread();
+            std::cerr << "[checkpoint-diag] t=" << nowMs
+                      << " currentThreadId=" << m_currentThreadId
+                      << " runningNonNull=" << (diagRunning != nullptr)
+                      << " priority=" << (diagRunning ? diagRunning->currentPriority : -1)
+                      << " hasReadyAtOrAbove=" << (diagRunning ? hasReadyAtOrAbovePriority(diagRunning->currentPriority) : false)
+                      << " eeCycle=" << m_eeCycle
+                      << " sliceEndCycle=" << m_sliceEndCycle
+                      << " checkpointPending=" << m_checkpointPending.load(std::memory_order_relaxed)
+                      << std::endl;
+        }
+    }
+
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
     {

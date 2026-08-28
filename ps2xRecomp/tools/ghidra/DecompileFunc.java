@@ -14,7 +14,7 @@ import ghidra.util.task.ConsoleTaskMonitor;
 public class DecompileFunc extends GhidraScript {
     @Override
     public void run() throws Exception {
-        String[] targets = { "0x1693b0" };
+        String[] targets = { "0x25a9b0", "0x2595d0" };
 
         DecompInterface decomp = new DecompInterface();
         decomp.openProgram(currentProgram);

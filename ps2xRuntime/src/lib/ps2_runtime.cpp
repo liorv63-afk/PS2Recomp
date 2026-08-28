@@ -3265,6 +3265,46 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (memcmpA1Before <= PS2_RAM_SIZE - 4u) { std::memcpy(&memcmpBuf1Before, rdram + memcmpA1Before, 4u); }
     }
     ++m_nestedCallDepth;
+    // DIAGNOSTIC (2026-08-28): checking whether m_nestedCallDepth grows
+    // without bound over time (a genuine native C++ call-stack leak --
+    // something never properly unwinding) versus reaching a normal,
+    // bounded-but-deep peak. [return-to-zero] observations showed depth
+    // climbing 134->175 across several vblanks right before thread 1's
+    // documented "natural exit" (see project memory) -- sampling
+    // periodically (time-gated, like the scheduler's own heartbeat) to see
+    // the full trajectory across a whole run, not just at return-to-zero
+    // moments.
+    {
+        static std::atomic<int64_t> s_depthHeartbeatMs{0};
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        int64_t last = s_depthHeartbeatMs.load(std::memory_order_relaxed);
+        if (nowMs - last >= 250 &&
+            s_depthHeartbeatMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed))
+        {
+            std::cerr << "[depth-heartbeat] t=" << nowMs << " nestedCallDepth=" << m_nestedCallDepth
+                      << " threadId=" << (m_eeScheduler ? m_eeScheduler->currentThreadId() : -1)
+                      << std::endl;
+        }
+    }
+    // DIAGNOSTIC (2026-08-28): once the runaway-recursion leak (see project
+    // memory) is well underway, capture every dispatch's target/source/kind
+    // to find the exact repeating call pattern -- capped tightly since this
+    // fires on every single nested call once past the threshold.
+    if (m_nestedCallDepth > 300 && m_nestedCallDepth < 320)
+    {
+        static std::atomic<uint32_t> s_loggedRunawayPattern{0u};
+        if (s_loggedRunawayPattern.fetch_add(1u, std::memory_order_relaxed) < 300u)
+        {
+            std::cerr << "[runaway-pattern] depth=" << m_nestedCallDepth
+                      << " target=0x" << std::hex << targetPc
+                      << " source=0x" << sourcePc
+                      << " kind=" << describeGuestBranchKind(kind)
+                      << " threadId=" << std::dec << (m_eeScheduler ? m_eeScheduler->currentThreadId() : -1)
+                      << std::endl;
+        }
+    }
     targetFn(rdram, ctx, this);
     --m_nestedCallDepth;
 
