@@ -289,6 +289,28 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     (void)valueHi;
     (void)op;
 
+    // DIAGNOSTIC (2026-08-28): FUN_00160530, the real VBLANK interrupt
+    // handler (see project memory), calls a registered callback function
+    // pointer at 0x3d26bc if non-null, immediately after reading the
+    // GS_CSR field/vblank status -- very likely DQ8's actual mechanism for
+    // driving per-frame update/render work from the interrupt itself
+    // (rather than a separate persistent game-loop thread, none of which
+    // has been found this session). If this pointer is NEVER written,
+    // every vblank does only minimal housekeeping (frame counter, a
+    // conditional semaphore signal) and the real per-frame work never
+    // fires -- watching for any write to confirm or rule this out.
+    if (guestAddr >= 0x3d26bcu && guestAddr < 0x3d26c0u)
+    {
+        static std::atomic<uint32_t> s_watchVblankCallbackLogCount{0u};
+        if (s_watchVblankCallbackLogCount.fetch_add(1u, std::memory_order_relaxed) < 100u)
+        {
+            std::cerr << "[watch-vblank-callback] addr=0x" << std::hex << guestAddr
+                      << " size=" << std::dec << size
+                      << " valueLo=0x" << std::hex << valueLo
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << std::dec << std::endl;
+        }
+    }
     // Temporary watchpoint: log any write touching the DQ8 IOP-ready poll flag
     // at 0x3d5740 (see project memory) so we can see what, if anything, ever
     // sets it and from where.

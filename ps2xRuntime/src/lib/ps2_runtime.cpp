@@ -2090,6 +2090,75 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
+    if (targetPc == 0x1693b0u)
+    {
+        // DIAGNOSTIC (2026-08-28): FUN_001693b0 is, per Ghidra decompile
+        // (see project memory), THE REAL MAIN GAME LOOP -- calls
+        // FUN_001690e0() once, then an infinite outer scene-transition loop
+        // (switch on sRam003d2740, loads TITLE/BATTLE/VIEWER.BIN, calls a
+        // 3-row scene-handler table at 0x395060/0x395090/0x3950c0) wrapping
+        // an infinite inner per-frame loop calling the scene's update
+        // handler + FUN_00165570 (token dispatcher) every iteration. This
+        // MUST be thread 1's own top-level entry, given it calls
+        // FUN_001690e0 (confirmed called exactly once) as its first act.
+        // Checking whether it's ever reached, and how many times its outer
+        // loop body executes -- if it's reached but the loop never iterates
+        // more than once, that's the real deadlock; if it's never reached
+        // at all, thread 1 must not actually be started here.
+        static std::atomic<uint32_t> s_callsMainLoop{0u};
+        const uint32_t n = s_callsMainLoop.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 20u)
+        {
+            std::cerr << "[main-loop-entry] #" << std::dec << n
+                       << " source=0x" << std::hex << sourcePc << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x1ce490u || targetPc == 0x34a160u || targetPc == 0x1ce350u ||
+        targetPc == 0x1a2450u)
+    {
+        // DIAGNOSTIC (2026-08-28): FUN_001ce490 is, per Ghidra decompile
+        // (see project memory), very likely DQ8's real "load a level/zone,
+        // run the loading-screen loop" function -- its loop body calls
+        // FUN_00165570(0x3f17b0) (the entity/token dispatcher chased all
+        // session) every iteration. Its call chain (FUN_001ce490 ->
+        // FUN_001a2450 -> FUN_001a1c60 -> FUN_0019f2f0, the real
+        // open-file-for-streaming API) was already confirmed dead at the
+        // FUN_0019f2f0/FUN_001a1c60 end; checking exactly where in this
+        // chain execution actually stops.
+        static std::atomic<uint32_t> s_callsLevelLoadChain{0u};
+        const uint32_t n = s_callsLevelLoadChain.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 100u)
+        {
+            std::cerr << "[levelload-chain-call] target=0x" << std::hex << targetPc
+                       << " source=0x" << sourcePc
+                       << std::dec << std::endl;
+        }
+    }
+
+    if (targetPc == 0x19f2f0u || targetPc == 0x1a1c60u)
+    {
+        // DIAGNOSTIC (2026-08-28): FUN_0019f2f0 is, per Ghidra decompile
+        // (see project memory), DQ8's real "open a file for async
+        // streaming" public API -- normalizes a path string, allocates a
+        // stream slot via FUN_0024dc60 (thread 9's subsystem, semId 205,
+        // confirmed dead all session), then passes the path into the
+        // streaming subsystem. Its only caller is FUN_001a1c60. Checking
+        // whether either is ever reached live -- this is the most direct
+        // lead yet for what should trigger real asset loading.
+        static std::atomic<uint32_t> s_callsFileStreamApi{0u};
+        static std::atomic<uint32_t> s_callsFileStreamApiCaller{0u};
+        const uint32_t n = (targetPc == 0x19f2f0u)
+                                ? s_callsFileStreamApi.fetch_add(1u, std::memory_order_relaxed)
+                                : s_callsFileStreamApiCaller.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 50u)
+        {
+            std::cerr << "[filestream-api-call] target=0x" << std::hex << targetPc
+                       << " source=0x" << sourcePc
+                       << std::dec << std::endl;
+        }
+    }
+
     if (targetPc == 0x1690e0u)
     {
         // DIAGNOSTIC (2026-08-28): re-checking whether FUN_001690e0 (labeled
